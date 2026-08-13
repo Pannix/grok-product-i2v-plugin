@@ -34,7 +34,62 @@ var jsxs = jsx;
 var PLUGIN_ID = "grok-product-i2v";
 var DEFAULT_DURATION = "6";
 var DEFAULT_RATIO = "\u4FDD\u6301\u9996\u5E27\u753B\u5E45";
+var DEFAULT_LOCK_MODE = "strict";
 var DEFAULT_SOUND = "\u8F7B\u5FAE\u771F\u5B9E\u73AF\u5883\u58F0\u6216\u6750\u8D28\u6469\u64E6\u58F0\uFF1B\u4E0D\u8981\u65C1\u767D\u3001\u4E0D\u8981\u53F0\u8BCD\u3001\u4E0D\u8981\u97F3\u4E50\u62A2\u4E3B\u4F53\u3002";
+var XAI_NATIVE_VIDEO_SCRIPT = `// \u539F\u751F xAI Grok Image-to-Video\uFF1A\u5FC5\u987B\u628A\u9996\u5E27\u653E\u8FDB image \u5B57\u6BB5
+const source = images[0];
+if (!source) throw new Error("\u8BF7\u5148\u8FDE\u63A5\u5546\u54C1\u9996\u5E27\u56FE\u7247");
+
+const rootWithSlash = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+const root = rootWithSlash.endsWith("/v1") ? rootWithSlash.slice(0, -3) : rootWithSlash;
+const headers = { "Content-Type": "application/json", Authorization: "Bearer " + apiKey };
+const aspectRatio = params.size === "720x1280"
+  ? "9:16"
+  : params.size === "1280x720"
+    ? "16:9"
+    : params.size === "1024x1024"
+      ? "1:1"
+      : undefined;
+const resolution = params.resolution
+  ? (/^[0-9]+$/.test(params.resolution) ? params.resolution + "p" : params.resolution)
+  : undefined;
+
+const task = await request({
+  method: "post",
+  url: root + "/v1/videos/generations",
+  headers,
+  data: {
+    model,
+    prompt,
+    image: { url: source },
+    duration: Number(params.seconds),
+    ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+    ...(resolution ? { resolution } : {}),
+  },
+});
+
+const requestId = task.request_id || task.id;
+if (!requestId) throw new Error("xAI \u89C6\u9891\u63A5\u53E3\u6CA1\u6709\u8FD4\u56DE request_id");
+
+return await poll(
+  () => request({
+    method: "get",
+    url: root + "/v1/videos/" + requestId,
+    headers: { Authorization: "Bearer " + apiKey },
+  }),
+  (state) => {
+    if (state.status === "done") {
+      const url = state.video?.url || state.video_url || state.url;
+      if (!url) throw new Error("xAI \u89C6\u9891\u4EFB\u52A1\u5B8C\u6210\u4F46\u6CA1\u6709\u8FD4\u56DE\u89C6\u9891\u5730\u5740");
+      return { url };
+    }
+    if (state.status === "failed" || state.status === "expired" || state.status === "cancelled") {
+      throw new Error(state.error?.message || "xAI \u89C6\u9891\u4EFB\u52A1 " + state.status);
+    }
+    return null;
+  },
+  { intervalMs: 5000, timeoutMs: 600000 },
+);`;
 var AI_SYSTEM = `\u4F60\u662F\u5546\u54C1\u56FE\u751F\u89C6\u9891\u63D0\u793A\u8BCD\u7F16\u5BFC\u3002\u4F60\u53EA\u80FD\u4F9D\u636E\u7528\u6237\u63D0\u4F9B\u7684\u4E8B\u5B9E\u548C\u201C\u9996\u5E27\u5546\u54C1\u56FE\u4F5C\u4E3A\u552F\u4E00\u5546\u54C1\u4E8B\u5B9E\u57FA\u51C6\u201D\u6765\u5199\u63D0\u793A\u8BCD\uFF0C\u4E0D\u8981\u81C6\u6D4B\u54C1\u724C\u3001\u578B\u53F7\u3001\u6750\u8D28\u3001\u80CC\u9762\u3001\u5E95\u90E8\u3001\u5185\u90E8\u7ED3\u6784\u6216\u4E0D\u53EF\u89C1\u6587\u5B57\u3002
 
 \u5FC5\u987B\u9075\u5B88\uFF1A
@@ -64,6 +119,7 @@ function readDraft(ctx) {
     sound: metadataText(metadata, "sound", DEFAULT_SOUND),
     duration: normalizeDuration(metadataText(metadata, "duration", DEFAULT_DURATION)),
     ratio: metadataText(metadata, "ratio", DEFAULT_RATIO),
+    lockMode: metadataText(metadata, "lockMode", DEFAULT_LOCK_MODE),
     textModel: metadataText(metadata, "textModel"),
     videoModel: metadataText(metadata, "videoModel")
   };
@@ -116,11 +172,16 @@ function cameraInstruction(brief) {
 function splitLines(value) {
   return value.split(/[\n,，;；]/).map((item) => item.trim()).filter(Boolean);
 }
+function promptFingerprint(draft) {
+  return [draft.brief, draft.productFacts, draft.mustKeep, draft.allowedChange, draft.forbidden, draft.sound, draft.duration, draft.ratio, draft.lockMode].join("\u241F");
+}
 function buildNegativePrompt(draft) {
   const base = [
     "\u5546\u54C1\u8EAB\u4EFD\u6F02\u79FB",
     "\u6539\u6B3E\u3001\u6362\u8272\u3001\u6362\u6750\u8D28\u3001\u6539\u53D8\u8F6E\u5ED3\u6216\u6BD4\u4F8B",
     "logo\u3001\u54C1\u724C\u540D\u3001\u5305\u88C5\u6587\u5B57\u3001\u6807\u7B7E\u6587\u5B57\u53D8\u5F62\u6216\u4E71\u7801",
+    "\u628A\u539F\u5305\u88C5\u6539\u6210\u7EB8\u76D2\u3001\u74F6\u5B50\u3001\u7F50\u5B50\u3001\u793C\u76D2\u6216\u5176\u4ED6\u5305\u88C5\u5F62\u6001",
+    "\u91CD\u65B0\u8BBE\u8BA1\u5305\u88C5\u6B63\u9762\u7248\u5F0F\u3001logo\u3001\u63D2\u753B\u6216\u6587\u5B57\u5C42\u7EA7",
     "\u65B0\u589E\u4EBA\u7269\u3001\u624B\u3001\u9053\u5177\u3001\u914D\u4EF6\u3001\u88C5\u9970\u6216\u7B2C\u4E8C\u4E2A\u5546\u54C1",
     "\u5546\u54C1\u878D\u5316\u3001\u62C9\u4F38\u3001\u6298\u53E0\u3001\u65AD\u88C2\u3001\u91CD\u590D\u3001\u6F02\u6D6E\u3001\u7A7F\u6A21",
     "\u8FB9\u7F18\u6296\u52A8\u3001\u5C40\u90E8\u95EA\u70C1\u3001\u7EB9\u7406\u722C\u52A8\u3001\u7EC6\u8282\u8DF3\u53D8",
@@ -139,14 +200,16 @@ function buildPromptResult(draft, sourceLabel, hasImage) {
   const productFacts = draft.productFacts || "\u672A\u63D0\u4F9B\u989D\u5916\u5546\u54C1\u4E8B\u5B9E\uFF1B\u53EA\u4F9D\u636E\u9996\u5E27\u56FE\u7247\u4E2D\u5B9E\u9645\u53EF\u89C1\u5185\u5BB9\u3002";
   const mustKeep = draft.mustKeep || "\u9996\u5E27\u4E2D\u53EF\u89C1\u7684\u5546\u54C1\u8EAB\u4EFD\u3001\u8F6E\u5ED3\u3001\u6BD4\u4F8B\u3001\u989C\u8272\u3001\u6750\u8D28\u3001\u5305\u88C5\u3001\u914D\u4EF6\u3001\u6587\u5B57\u3001\u5149\u5F71\u5173\u7CFB\u548C\u4E3B\u4F53\u4F4D\u7F6E\u3002";
   const allowedChange = draft.allowedChange || "\u53EA\u5141\u8BB8\u7528\u6237\u76EE\u6807\u4E2D\u7684\u4E3B\u52A8\u4F5C\u3001\u8F7B\u5FAE\u955C\u5934\u8FD0\u52A8\u3001\u81EA\u7136\u5149\u5F71\u53D8\u5316\u548C\u4E0E\u52A8\u4F5C\u4E00\u81F4\u7684\u7EC6\u5C0F\u73AF\u5883\u53D8\u5316\u3002";
+  const strictFrame = draft.lockMode !== "creative";
   const positivePrompt = [
-    "\u751F\u6210\u4E00\u6761\u4E25\u683C\u57FA\u4E8E\u9644\u52A0\u5546\u54C1\u9996\u5E27\u56FE\u7247\u7684\u56FE\u751F\u89C6\u9891\u3002\u9644\u52A0\u9996\u5E27\u56FE\u7247\u662F\u5546\u54C1\u8EAB\u4EFD\u548C\u6240\u6709\u53EF\u89C1\u7EC6\u8282\u7684\u552F\u4E00\u4E8B\u5B9E\u57FA\u51C6\u3002",
+    strictFrame ? "\u4E25\u683C\u9996\u5E27\u56FE\u751F\u89C6\u9891\u6A21\u5F0F\uFF1A\u9644\u52A0\u9996\u5E27\u56FE\u7247\u662F\u5546\u54C1\u8EAB\u4EFD\u548C\u6240\u6709\u53EF\u89C1\u7EC6\u8282\u7684\u552F\u4E00\u4E8B\u5B9E\u57FA\u51C6\uFF1B\u5B83\u5FC5\u987B\u4F5C\u4E3A\u5B9E\u9645 image-to-video \u8D77\u59CB\u5E27\u4F7F\u7528\uFF0C\u89C6\u9891\u7B2C 0 \u5E27\u5E94\u4E0E\u9644\u52A0\u56FE\u7247\u4E00\u81F4\uFF1B\u4E0D\u8981\u628A\u56FE\u7247\u5F53\u6210\u4EC5\u4F9B\u7075\u611F\u7684\u53C2\u8003\u56FE\uFF0C\u4E5F\u4E0D\u8981\u8FDB\u884C\u6587\u5B57\u751F\u56FE\u6216\u91CD\u65B0\u8BBE\u8BA1\u5305\u88C5\u3002" : "\u751F\u6210\u4E00\u6761\u57FA\u4E8E\u9644\u52A0\u5546\u54C1\u56FE\u7247\u7684\u56FE\u751F\u89C6\u9891\uFF1B\u9644\u52A0\u56FE\u7247\u662F\u5546\u54C1\u8EAB\u4EFD\u548C\u6240\u6709\u53EF\u89C1\u7EC6\u8282\u7684\u4E3B\u8981\u4E8B\u5B9E\u57FA\u51C6\uFF0C\u4F46\u5141\u8BB8\u6709\u9650\u7684\u521B\u610F\u91CD\u6784\u3002",
     `\u89C6\u9891\u65F6\u957F\u7EA6 ${draft.duration} \u79D2\u3002${ratioInstruction(draft.ratio)}`,
     "\u4ECE\u9996\u5E27\u753B\u9762\u5F00\u59CB\uFF0C\u524D 0.0\u20131.0 \u79D2\u4FDD\u6301\u6784\u56FE\u7A33\u5B9A\uFF0C\u8BA9\u5546\u54C1\u8FB9\u7F18\u3001logo\u3001\u5305\u88C5\u6587\u5B57\u548C\u6750\u8D28\u7EB9\u7406\u6E05\u6670\u53EF\u8FA8\u3002",
     `0.0\u2013${Math.max(1, Number(draft.duration) * 0.18).toFixed(1)} \u79D2\uFF1A\u7A33\u5B9A\u9996\u5E27\uFF0C\u4E0D\u65B0\u589E\u52A8\u4F5C\u3002`,
     `1.0\u2013${Math.max(1.2, Number(draft.duration) * 0.78).toFixed(1)} \u79D2\uFF1A\u53EA\u6267\u884C\u4E00\u4E2A\u4E3B\u52A8\u4F5C\u2014\u2014${action}\u3002\u52A8\u4F5C\u6162\u3001\u8FDE\u7EED\u3001\u514B\u5236\uFF0C\u5546\u54C1\u4E3B\u4F53\u4E0D\u6539\u6B3E\u3002`,
     `${Math.max(1.2, Number(draft.duration) * 0.78).toFixed(1)}\u2013${draft.duration} \u79D2\uFF1A\u52A8\u4F5C\u81EA\u7136\u6536\u5C3E\uFF0C\u56DE\u5230\u7A33\u5B9A\u5C55\u793A\u72B6\u6001\uFF0C\u4E0D\u5F15\u5165\u7B2C\u4E8C\u4E2A\u52A8\u4F5C\u3002`,
     camera,
+    `\u5546\u54C1\u4E8B\u5B9E\uFF1A${productFacts}`,
     `\u5546\u54C1\u9501\u5B9A\uFF1A${mustKeep}`,
     `\u5141\u8BB8\u53D8\u5316\uFF1A${allowedChange}`,
     "\u4E0D\u8981\u6839\u636E\u60F3\u8C61\u8865\u5168\u9996\u5E27\u672A\u5C55\u793A\u7684\u80CC\u9762\u3001\u5E95\u90E8\u3001\u5185\u90E8\u7ED3\u6784\u6216\u65B0\u89C6\u89D2\uFF1B\u770B\u4E0D\u5230\u7684\u90E8\u5206\u4FDD\u6301\u4E0D\u53EF\u89C1\u6216\u4FDD\u6301\u539F\u6784\u56FE\u3002",
@@ -159,6 +222,7 @@ function buildPromptResult(draft, sourceLabel, hasImage) {
     `- \u9996\u5E27\u72B6\u6001\uFF1A${imageStatus}`,
     `- \u76EE\u6807\uFF1A${draft.brief || "\u7A33\u5B9A\u5C55\u793A\u5546\u54C1\u6750\u8D28\u4E0E\u8F6E\u5ED3"}`,
     `- \u65F6\u957F\uFF1A${draft.duration} \u79D2\uFF5C\u753B\u5E45\uFF1A${draft.ratio}`,
+    `- \u9501\u5B9A\u6A21\u5F0F\uFF1A${strictFrame ? "\u4E25\u683C\u9996\u5E27\uFF08\u8981\u6C42\u6A21\u578B\u63A5\u53E3\u4F7F\u7528 image-to-video \u7684 image \u5B57\u6BB5\uFF09" : "\u521B\u610F\u53C2\u8003\uFF08\u53EF\u80FD\u91CD\u6784\u5305\u88C5\uFF09"}`,
     "",
     "## 1. \u5546\u54C1\u4E8B\u5B9E\u4E0E\u9501\u5B9A",
     `- \u5546\u54C1\u4E8B\u5B9E\uFF1A${productFacts}`,
@@ -183,7 +247,7 @@ function buildPromptResult(draft, sourceLabel, hasImage) {
     negativePrompt,
     "```",
     "",
-    hasImage ? "\u53EF\u76F4\u63A5\u628A\u672C\u8282\u70B9\u7684\u6B63\u5411\u63D0\u793A\u8BCD\u8F93\u51FA\u8FDE\u63A5\u5230\u89C6\u9891\u751F\u6210\u8282\u70B9\uFF1B\u672C\u8282\u70B9\u4F1A\u628A\u4E0A\u6E38\u5546\u54C1\u56FE\u4F5C\u4E3A\u9996\u5E27\u53C2\u8003\u3002" : "\u8BF7\u5148\u628A\u5546\u54C1\u56FE\u7247\u8282\u70B9\u8FDE\u5230\u672C\u8282\u70B9\uFF0C\u518D\u8FDB\u884C\u56FE\u751F\u89C6\u9891\uFF1B\u5F53\u524D\u6CA1\u6709\u9996\u5E27\u65F6\u53EA\u5EFA\u8BAE\u68C0\u67E5\u811A\u672C\uFF0C\u4E0D\u5EFA\u8BAE\u76F4\u63A5\u751F\u6210\u3002"
+    hasImage ? "\u672C\u8282\u70B9\u4F1A\u628A\u4E0A\u6E38\u5546\u54C1\u56FE\u4F20\u5165\u89C6\u9891\u751F\u6210\u8C03\u7528\uFF1B\u4E25\u683C\u9996\u5E27\u6A21\u5F0F\u8FD8\u8981\u6C42\u6240\u9009\u6A21\u578B\u811A\u672C\u628A images[0] \u6620\u5C04\u5230\u4F9B\u5E94\u5546\u7684 image-to-video \u5B57\u6BB5\u3002\u901A\u7528\u53EA\u53D1\u9001 prompt \u7684\u89C6\u9891\u811A\u672C\u4F1A\u5FFD\u7565\u56FE\u7247\u3002" : "\u8BF7\u5148\u628A\u5546\u54C1\u56FE\u7247\u8282\u70B9\u8FDE\u5230\u672C\u8282\u70B9\uFF0C\u518D\u8FDB\u884C\u56FE\u751F\u89C6\u9891\uFF1B\u5F53\u524D\u6CA1\u6709\u9996\u5E27\u65F6\u53EA\u5EFA\u8BAE\u68C0\u67E5\u811A\u672C\uFF0C\u4E0D\u5EFA\u8BAE\u76F4\u63A5\u751F\u6210\u3002"
   ].join("\n");
   return { content, positivePrompt, negativePrompt };
 }
@@ -198,6 +262,7 @@ function buildAiPrompt(draft, fallback, sourceLabel, hasImage) {
     `\u7981\u6B62\u5185\u5BB9\uFF1A${draft.forbidden || "\u65B0\u589E\u4EBA\u7269\u3001\u624B\u3001\u9053\u5177\u3001\u6587\u5B57\u3001\u6539\u6B3E\u548C\u7ED3\u6784\u6F02\u79FB"}`,
     `\u58F0\u97F3\uFF1A${draft.sound || DEFAULT_SOUND}`,
     `\u65F6\u957F\uFF1A${draft.duration} \u79D2\uFF1B\u753B\u5E45\uFF1A${draft.ratio}`,
+    `\u9996\u5E27\u6A21\u5F0F\uFF1A${draft.lockMode === "creative" ? "\u521B\u610F\u53C2\u8003" : "\u4E25\u683C\u9996\u5E27 image-to-video"}`,
     "",
     "\u4E0B\u9762\u662F\u6A21\u677F\u57FA\u7EBF\u3002\u8BF7\u5728\u4E0D\u5F15\u5165\u672A\u8BC1\u5B9E\u5546\u54C1\u4E8B\u5B9E\u7684\u524D\u63D0\u4E0B\u6DA6\u8272\u5B83\uFF1A",
     fallback.content
@@ -242,12 +307,24 @@ function GrokProductI2VContent({ ctx }) {
   const copyStatus = metadataText(ctx.node.metadata, "copyStatus");
   const textModels = useMemo(() => ctx.ai.listModels("text"), [ctx.ai]);
   const videoModels = useMemo(() => ctx.ai.listModels("video"), [ctx.ai]);
-  const setField = (key, value) => ctx.updateMetadata({ [key]: value });
+  const promptFields = /* @__PURE__ */ new Set(["brief", "productFacts", "mustKeep", "allowedChange", "forbidden", "sound", "duration", "ratio", "lockMode"]);
+  const setField = (key, value) => ctx.updateMetadata({ [key]: value, ...promptFields.has(key) ? { content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "" } : {} });
   const stopCanvas = (event) => event.stopPropagation();
   const fallback = () => buildPromptResult(draft, sourceLabel, Boolean(sourceImage));
+  const currentPromptResult = () => {
+    const storedFingerprint = metadataText(ctx.node.metadata, "promptFingerprint");
+    if (positivePrompt && storedFingerprint && storedFingerprint === promptFingerprint(draft)) {
+      return { positivePrompt, negativePrompt: metadataText(ctx.node.metadata, "negativePrompt") };
+    }
+    return fallback();
+  };
+  const currentPromptContent = () => {
+    const storedFingerprint = metadataText(ctx.node.metadata, "promptFingerprint");
+    return output && storedFingerprint && storedFingerprint === promptFingerprint(draft) ? output : fallback().content;
+  };
   const saveTemplate = () => {
     const result = fallback();
-    ctx.updateMetadata({ content: result.content, positivePrompt: result.positivePrompt, negativePrompt: result.negativePrompt, status: "success", errorDetails: "", copyStatus: "" });
+    ctx.updateMetadata({ content: result.content, positivePrompt: result.positivePrompt, negativePrompt: result.negativePrompt, promptFingerprint: promptFingerprint(draft), status: "success", errorDetails: "", copyStatus: "" });
   };
   const polishWithAi = async () => {
     const base = fallback();
@@ -256,7 +333,7 @@ function GrokProductI2VContent({ ctx }) {
     try {
       const response = await ctx.ai.generateText(buildAiPrompt(draft, base, sourceLabel, Boolean(sourceImage)), { system: AI_SYSTEM, model: draft.textModel || void 0 });
       const result = parseAiResponse(response.text, base);
-      ctx.updateMetadata({ content: result.content, positivePrompt: result.positivePrompt, negativePrompt: result.negativePrompt, status: "success", errorDetails: "" });
+      ctx.updateMetadata({ content: result.content, positivePrompt: result.positivePrompt, negativePrompt: result.negativePrompt, promptFingerprint: promptFingerprint(draft), status: "success", errorDetails: "" });
     } catch (error2) {
       ctx.updateMetadata({ status: "error", errorDetails: errorMessage(error2) });
     } finally {
@@ -264,7 +341,7 @@ function GrokProductI2VContent({ ctx }) {
     }
   };
   const createTextOutput = () => {
-    const result = positivePrompt ? { positivePrompt } : fallback();
+    const result = currentPromptResult();
     const id = `${PLUGIN_ID}-text-${Date.now()}`;
     ctx.applyOps([
       {
@@ -286,7 +363,7 @@ function GrokProductI2VContent({ ctx }) {
       ctx.updateMetadata({ status: "error", errorDetails: "\u8BF7\u5148\u628A\u5546\u54C1\u56FE\u7247\u8282\u70B9\u8FDE\u63A5\u5230\u672C\u8282\u70B9\u3002" });
       return;
     }
-    const result = positivePrompt ? { positivePrompt, negativePrompt: metadataText(ctx.node.metadata, "negativePrompt") } : fallback();
+    const result = currentPromptResult();
     setBusy("video");
     ctx.updateMetadata({ status: "loading", errorDetails: "" });
     try {
@@ -327,6 +404,7 @@ function GrokProductI2VContent({ ctx }) {
     ctx.updateMetadata({ copyStatus: ok ? "\u5DF2\u590D\u5236" : "\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u624B\u52A8\u9009\u62E9\u6587\u672C\u590D\u5236" });
     window.setTimeout(() => ctx.updateMetadata({ copyStatus: "" }), 1800);
   };
+  const copyNativeXaiScript = () => void copy(XAI_NATIVE_VIDEO_SCRIPT);
   const buttonStyle = { border: `1px solid ${ctx.theme.node.stroke}`, borderRadius: 8, background: ctx.theme.toolbar.panel, color: ctx.theme.node.text, padding: "6px 9px", cursor: "pointer", fontSize: 12 };
   const primaryButtonStyle = { ...buttonStyle, border: "1px solid #7c3aed", background: "#7c3aed", color: "#fff" };
   const inputStyle = { width: "100%", boxSizing: "border-box", border: `1px solid ${ctx.theme.node.stroke}`, borderRadius: 7, background: ctx.theme.node.panel, color: ctx.theme.node.text, padding: "7px 8px", fontSize: 12, outline: "none" };
@@ -360,20 +438,26 @@ function GrokProductI2VContent({ ctx }) {
         /* @__PURE__ */ jsx("select", { value: draft.ratio, onChange: (event) => setField("ratio", event.target.value), onMouseDown: stopCanvas, style: inputStyle, children: ["\u4FDD\u6301\u9996\u5E27\u753B\u5E45", "9:16 \u7AD6\u7248", "16:9 \u6A2A\u7248", "1:1 \u65B9\u5F62"].map((value) => /* @__PURE__ */ jsx("option", { value, children: value }, value)) })
       ] })
     ] }),
-    /* @__PURE__ */ jsxs("details", { onMouseDown: stopCanvas, children: [
-      /* @__PURE__ */ jsx("summary", { style: { cursor: "pointer", color: ctx.theme.node.muted, fontSize: 11 }, children: "\u5546\u54C1\u9501\u5B9A\u4E0E\u58F0\u97F3\uFF08\u53EF\u9009\uFF09" }),
+    /* @__PURE__ */ jsxs("details", { open: true, onMouseDown: stopCanvas, children: [
+      /* @__PURE__ */ jsx("summary", { style: { cursor: "pointer", color: ctx.theme.node.muted, fontSize: 11 }, children: "\u5546\u54C1\u9501\u5B9A\u4E0E\u58F0\u97F3\uFF08\u4E25\u683C\u9996\u5E27\u6A21\u5F0F\uFF09" }),
       /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 6, paddingTop: 7 }, children: [
+        /* @__PURE__ */ jsxs("select", { value: draft.lockMode, onChange: (event) => setField("lockMode", event.target.value), onMouseDown: stopCanvas, style: inputStyle, "aria-label": "\u5546\u54C1\u9501\u5B9A\u6A21\u5F0F", children: [
+          /* @__PURE__ */ jsx("option", { value: "strict", children: "\u4E25\u683C\u9996\u5E27\uFF1A\u4E0D\u6539\u5305\u88C5\uFF08\u63A8\u8350\uFF09" }),
+          /* @__PURE__ */ jsx("option", { value: "creative", children: "\u521B\u610F\u53C2\u8003\uFF1A\u5141\u8BB8\u6709\u9650\u91CD\u6784" })
+        ] }),
         /* @__PURE__ */ jsx("input", { value: draft.productFacts, placeholder: "\u5546\u54C1\u4E8B\u5B9E\uFF1A\u540D\u79F0\u3001\u6750\u8D28\u3001\u989C\u8272\u3001\u5305\u88C5\u7B49\uFF08\u53EA\u586B\u786E\u5B9A\u4E8B\u5B9E\uFF09", onChange: (event) => setField("productFacts", event.target.value), onMouseDown: stopCanvas, style: inputStyle }),
         /* @__PURE__ */ jsx("input", { value: draft.mustKeep, placeholder: "\u5FC5\u987B\u4FDD\u7559\uFF1A\u8F6E\u5ED3\u3001logo\u3001\u6587\u5B57\u3001\u914D\u4EF6\u2026\u2026", onChange: (event) => setField("mustKeep", event.target.value), onMouseDown: stopCanvas, style: inputStyle }),
         /* @__PURE__ */ jsx("input", { value: draft.allowedChange, placeholder: "\u5141\u8BB8\u53D8\u5316\uFF1A\u9AD8\u5149\u3001\u8F7B\u5FAE\u955C\u5934\u3001\u84B8\u6C7D\u3001\u6DB2\u4F53\u7B49", onChange: (event) => setField("allowedChange", event.target.value), onMouseDown: stopCanvas, style: inputStyle }),
         /* @__PURE__ */ jsx("input", { value: draft.forbidden, placeholder: "\u989D\u5916\u7981\u6B62\uFF1A\u4EBA\u7269\u3001\u624B\u3001\u9053\u5177\u3001\u67D0\u79CD\u53D8\u5F62\u2026\u2026", onChange: (event) => setField("forbidden", event.target.value), onMouseDown: stopCanvas, style: inputStyle }),
-        /* @__PURE__ */ jsx("input", { value: draft.sound, placeholder: DEFAULT_SOUND, onChange: (event) => setField("sound", event.target.value), onMouseDown: stopCanvas, style: inputStyle })
+        /* @__PURE__ */ jsx("input", { value: draft.sound, placeholder: DEFAULT_SOUND, onChange: (event) => setField("sound", event.target.value), onMouseDown: stopCanvas, style: inputStyle }),
+        /* @__PURE__ */ jsx("div", { style: { color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.4 }, children: "\u4E25\u683C\u9996\u5E27\u53EA\u5728\u89C6\u9891\u6A21\u578B\u811A\u672C\u771F\u6B63\u4F7F\u7528 image-to-video \u56FE\u7247\u5B57\u6BB5\u65F6\u751F\u6548\uFF1B\u901A\u7528\u53EA\u53D1\u9001 prompt \u7684\u89C6\u9891\u811A\u672C\u4F1A\u5FFD\u7565\u4E0A\u6E38\u56FE\u7247\u3002" })
       ] })
     ] }),
     /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 }, children: [
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: saveTemplate, style: primaryButtonStyle, disabled: busy !== null, children: "\u751F\u6210\u6A21\u677F\u811A\u672C" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void polishWithAi(), style: buttonStyle, disabled: busy !== null, children: busy === "text" ? "AI\u6DA6\u8272\u4E2D\u2026" : "AI\u6DA6\u8272" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: createTextOutput, style: buttonStyle, disabled: busy !== null, children: "\u8F93\u51FA\u6B63\u5411\u63D0\u793A\u8BCD" }),
+      /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: copyNativeXaiScript, style: buttonStyle, disabled: busy !== null, children: "\u590D\u5236\u539F\u751F xAI \u811A\u672C" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void generateVideo(), style: buttonStyle, disabled: busy !== null || !sourceImage, children: busy === "video" ? "\u751F\u6210\u89C6\u9891\u4E2D\u2026" : "\u751F\u6210\u89C6\u9891\uFF08\u5F53\u524D\u6A21\u578B\uFF09" })
     ] }),
     /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }, children: [
@@ -392,27 +476,27 @@ function GrokProductI2VContent({ ctx }) {
       /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }, children: [
         /* @__PURE__ */ jsx("span", { style: { color: ctx.theme.node.muted, fontSize: 11 }, children: "\u811A\u672C\u9884\u89C8\uFF08\u8F93\u51FA\u8D44\u6E90\u4E3A\u6B63\u5411\u63D0\u793A\u8BCD\uFF09" }),
         /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 5 }, children: [
-          /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void copy(positivePrompt || fallback().positivePrompt), style: { ...buttonStyle, padding: "3px 7px", fontSize: 11 }, children: "\u590D\u5236\u6B63\u5411" }),
-          /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void copy(output || fallback().content), style: { ...buttonStyle, padding: "3px 7px", fontSize: 11 }, children: "\u590D\u5236\u5B8C\u6574" })
+          /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void copy(currentPromptResult().positivePrompt), style: { ...buttonStyle, padding: "3px 7px", fontSize: 11 }, children: "\u590D\u5236\u6B63\u5411" }),
+          /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void copy(currentPromptContent()), style: { ...buttonStyle, padding: "3px 7px", fontSize: 11 }, children: "\u590D\u5236\u5B8C\u6574" })
         ] })
       ] }),
-      /* @__PURE__ */ jsx("pre", { onWheel: stopCanvas, style: { minHeight: 0, flex: 1, overflow: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", borderRadius: 8, padding: 9, background: ctx.theme.toolbar.panel, color: ctx.theme.node.text, fontSize: 10, lineHeight: 1.45, fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace" }, children: output || "\u70B9\u51FB\u201C\u751F\u6210\u6A21\u677F\u811A\u672C\u201D\u5F00\u59CB\u3002\n\n\u63D0\u793A\uFF1A\u82E5\u8981\u8BA9\u4E0B\u6E38\u89C6\u9891\u8282\u70B9\u62FF\u5230\u9996\u5E27\uFF0C\u8BF7\u540C\u65F6\u628A\u5546\u54C1\u56FE\u7247\u8282\u70B9\u8FDE\u5230\u89C6\u9891\u914D\u7F6E/\u751F\u6210\u8282\u70B9\u3002" })
+      /* @__PURE__ */ jsx("pre", { onWheel: stopCanvas, style: { minHeight: 0, flex: 1, overflow: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", borderRadius: 8, padding: 9, background: ctx.theme.toolbar.panel, color: ctx.theme.node.text, fontSize: 10, lineHeight: 1.45, fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace" }, children: currentPromptContent() })
     ] })
   ] });
 }
 var index_default = definePlugin({
   id: PLUGIN_ID,
   name: "Grok \u5546\u54C1\u56FE\u751F\u89C6\u9891",
-  version: "0.1.0",
-  description: "\u628A\u5546\u54C1\u9996\u5E27\u3001\u52A8\u4F5C\u76EE\u6807\u548C\u5546\u54C1\u9501\u5B9A\u89C4\u5219\u6574\u7406\u6210 Grok \u56FE\u751F\u89C6\u9891\u811A\u672C\u3002",
+  version: "0.2.0",
+  description: "\u628A\u5546\u54C1\u9996\u5E27\u3001\u52A8\u4F5C\u76EE\u6807\u548C\u5546\u54C1\u9501\u5B9A\u89C4\u5219\u6574\u7406\u6210\u4E25\u683C\u9996\u5E27 Grok \u56FE\u751F\u89C6\u9891\u811A\u672C\uFF0C\u5E76\u63D0\u4F9B\u539F\u751F xAI \u6A21\u578B\u811A\u672C\u3002",
   nodes: [
     {
       type: `${PLUGIN_ID}:prompt`,
       title: "Grok \u5546\u54C1\u56FE\u751F\u89C6\u9891",
       icon: "\u{1F3AC}",
       description: "\u5546\u54C1\u9996\u5E27 \u2192 \u5546\u54C1\u9501\u5B9A \u2192 \u52A8\u4F5C\u65F6\u95F4\u8F74 \u2192 Grok \u6B63\u8D1F\u63D0\u793A\u8BCD",
-      defaultSize: { width: 520, height: 640 },
-      defaultMetadata: { brief: "", productFacts: "", mustKeep: "", allowedChange: "", forbidden: "", sound: DEFAULT_SOUND, duration: DEFAULT_DURATION, ratio: DEFAULT_RATIO, content: "", positivePrompt: "", negativePrompt: "", status: "idle" },
+      defaultSize: { width: 520, height: 720 },
+      defaultMetadata: { brief: "", productFacts: "", mustKeep: "", allowedChange: "", forbidden: "", sound: DEFAULT_SOUND, duration: DEFAULT_DURATION, ratio: DEFAULT_RATIO, lockMode: DEFAULT_LOCK_MODE, content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "", status: "idle" },
       minimapColor: "#7c3aed",
       hidePanel: true,
       resource: (node) => ({ kind: "text", text: asString(node.metadata?.positivePrompt) || asString(node.metadata?.content) }),
@@ -421,8 +505,10 @@ var index_default = definePlugin({
   ]
 });
 export {
+  XAI_NATIVE_VIDEO_SCRIPT,
   buildNegativePrompt,
   buildPromptResult,
   index_default as default,
-  normalizeDuration
+  normalizeDuration,
+  promptFingerprint
 };

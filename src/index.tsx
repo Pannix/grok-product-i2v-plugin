@@ -10,6 +10,7 @@ type Draft = {
     sound: string;
     duration: string;
     ratio: string;
+    lockMode: string;
     textModel: string;
     videoModel: string;
 };
@@ -23,7 +24,63 @@ type PromptResult = {
 const PLUGIN_ID = "grok-product-i2v";
 const DEFAULT_DURATION = "6";
 const DEFAULT_RATIO = "保持首帧画幅";
+const DEFAULT_LOCK_MODE = "strict";
 const DEFAULT_SOUND = "轻微真实环境声或材质摩擦声；不要旁白、不要台词、不要音乐抢主体。";
+
+const XAI_NATIVE_VIDEO_SCRIPT = `// 原生 xAI Grok Image-to-Video：必须把首帧放进 image 字段
+const source = images[0];
+if (!source) throw new Error("请先连接商品首帧图片");
+
+const rootWithSlash = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+const root = rootWithSlash.endsWith("/v1") ? rootWithSlash.slice(0, -3) : rootWithSlash;
+const headers = { "Content-Type": "application/json", Authorization: "Bearer " + apiKey };
+const aspectRatio = params.size === "720x1280"
+  ? "9:16"
+  : params.size === "1280x720"
+    ? "16:9"
+    : params.size === "1024x1024"
+      ? "1:1"
+      : undefined;
+const resolution = params.resolution
+  ? (/^[0-9]+$/.test(params.resolution) ? params.resolution + "p" : params.resolution)
+  : undefined;
+
+const task = await request({
+  method: "post",
+  url: root + "/v1/videos/generations",
+  headers,
+  data: {
+    model,
+    prompt,
+    image: { url: source },
+    duration: Number(params.seconds),
+    ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+    ...(resolution ? { resolution } : {}),
+  },
+});
+
+const requestId = task.request_id || task.id;
+if (!requestId) throw new Error("xAI 视频接口没有返回 request_id");
+
+return await poll(
+  () => request({
+    method: "get",
+    url: root + "/v1/videos/" + requestId,
+    headers: { Authorization: "Bearer " + apiKey },
+  }),
+  (state) => {
+    if (state.status === "done") {
+      const url = state.video?.url || state.video_url || state.url;
+      if (!url) throw new Error("xAI 视频任务完成但没有返回视频地址");
+      return { url };
+    }
+    if (state.status === "failed" || state.status === "expired" || state.status === "cancelled") {
+      throw new Error(state.error?.message || "xAI 视频任务 " + state.status);
+    }
+    return null;
+  },
+  { intervalMs: 5000, timeoutMs: 600000 },
+);`;
 
 const AI_SYSTEM = `你是商品图生视频提示词编导。你只能依据用户提供的事实和“首帧商品图作为唯一商品事实基准”来写提示词，不要臆测品牌、型号、材质、背面、底部、内部结构或不可见文字。
 
@@ -63,6 +120,7 @@ function readDraft(ctx: CanvasNodeContentProps["ctx"]): Draft {
         sound: metadataText(metadata, "sound", DEFAULT_SOUND),
         duration: normalizeDuration(metadataText(metadata, "duration", DEFAULT_DURATION)),
         ratio: metadataText(metadata, "ratio", DEFAULT_RATIO),
+        lockMode: metadataText(metadata, "lockMode", DEFAULT_LOCK_MODE),
         textModel: metadataText(metadata, "textModel"),
         videoModel: metadataText(metadata, "videoModel"),
     };
@@ -128,11 +186,17 @@ function splitLines(value: string) {
         .filter(Boolean);
 }
 
+function promptFingerprint(draft: Draft) {
+    return [draft.brief, draft.productFacts, draft.mustKeep, draft.allowedChange, draft.forbidden, draft.sound, draft.duration, draft.ratio, draft.lockMode].join("\u241f");
+}
+
 function buildNegativePrompt(draft: Draft) {
     const base = [
         "商品身份漂移",
         "改款、换色、换材质、改变轮廓或比例",
         "logo、品牌名、包装文字、标签文字变形或乱码",
+        "把原包装改成纸盒、瓶子、罐子、礼盒或其他包装形态",
+        "重新设计包装正面版式、logo、插画或文字层级",
         "新增人物、手、道具、配件、装饰或第二个商品",
         "商品融化、拉伸、折叠、断裂、重复、漂浮、穿模",
         "边缘抖动、局部闪烁、纹理爬动、细节跳变",
@@ -152,14 +216,18 @@ function buildPromptResult(draft: Draft, sourceLabel: string, hasImage: boolean)
     const productFacts = draft.productFacts || "未提供额外商品事实；只依据首帧图片中实际可见内容。";
     const mustKeep = draft.mustKeep || "首帧中可见的商品身份、轮廓、比例、颜色、材质、包装、配件、文字、光影关系和主体位置。";
     const allowedChange = draft.allowedChange || "只允许用户目标中的主动作、轻微镜头运动、自然光影变化和与动作一致的细小环境变化。";
+    const strictFrame = draft.lockMode !== "creative";
     const positivePrompt = [
-        "生成一条严格基于附加商品首帧图片的图生视频。附加首帧图片是商品身份和所有可见细节的唯一事实基准。",
+        strictFrame
+            ? "严格首帧图生视频模式：附加首帧图片是商品身份和所有可见细节的唯一事实基准；它必须作为实际 image-to-video 起始帧使用，视频第 0 帧应与附加图片一致；不要把图片当成仅供灵感的参考图，也不要进行文字生图或重新设计包装。"
+            : "生成一条基于附加商品图片的图生视频；附加图片是商品身份和所有可见细节的主要事实基准，但允许有限的创意重构。",
         `视频时长约 ${draft.duration} 秒。${ratioInstruction(draft.ratio)}`,
         "从首帧画面开始，前 0.0–1.0 秒保持构图稳定，让商品边缘、logo、包装文字和材质纹理清晰可辨。",
         `0.0–${Math.max(1, Number(draft.duration) * 0.18).toFixed(1)} 秒：稳定首帧，不新增动作。`,
         `1.0–${Math.max(1.2, Number(draft.duration) * 0.78).toFixed(1)} 秒：只执行一个主动作——${action}。动作慢、连续、克制，商品主体不改款。`,
         `${Math.max(1.2, Number(draft.duration) * 0.78).toFixed(1)}–${draft.duration} 秒：动作自然收尾，回到稳定展示状态，不引入第二个动作。`,
         camera,
+        `商品事实：${productFacts}`,
         `商品锁定：${mustKeep}`,
         `允许变化：${allowedChange}`,
         "不要根据想象补全首帧未展示的背面、底部、内部结构或新视角；看不到的部分保持不可见或保持原构图。",
@@ -173,6 +241,7 @@ function buildPromptResult(draft: Draft, sourceLabel: string, hasImage: boolean)
         `- 首帧状态：${imageStatus}`,
         `- 目标：${draft.brief || "稳定展示商品材质与轮廓"}`,
         `- 时长：${draft.duration} 秒｜画幅：${draft.ratio}`,
+        `- 锁定模式：${strictFrame ? "严格首帧（要求模型接口使用 image-to-video 的 image 字段）" : "创意参考（可能重构包装）"}`,
         "",
         "## 1. 商品事实与锁定",
         `- 商品事实：${productFacts}`,
@@ -197,7 +266,7 @@ function buildPromptResult(draft: Draft, sourceLabel: string, hasImage: boolean)
         negativePrompt,
         "```",
         "",
-        hasImage ? "可直接把本节点的正向提示词输出连接到视频生成节点；本节点会把上游商品图作为首帧参考。" : "请先把商品图片节点连到本节点，再进行图生视频；当前没有首帧时只建议检查脚本，不建议直接生成。",
+        hasImage ? "本节点会把上游商品图传入视频生成调用；严格首帧模式还要求所选模型脚本把 images[0] 映射到供应商的 image-to-video 字段。通用只发送 prompt 的视频脚本会忽略图片。" : "请先把商品图片节点连到本节点，再进行图生视频；当前没有首帧时只建议检查脚本，不建议直接生成。",
     ].join("\n");
 
     return { content, positivePrompt, negativePrompt };
@@ -214,6 +283,7 @@ function buildAiPrompt(draft: Draft, fallback: PromptResult, sourceLabel: string
         `禁止内容：${draft.forbidden || "新增人物、手、道具、文字、改款和结构漂移"}`,
         `声音：${draft.sound || DEFAULT_SOUND}`,
         `时长：${draft.duration} 秒；画幅：${draft.ratio}`,
+        `首帧模式：${draft.lockMode === "creative" ? "创意参考" : "严格首帧 image-to-video"}`,
         "",
         "下面是模板基线。请在不引入未证实商品事实的前提下润色它：",
         fallback.content,
@@ -264,13 +334,25 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
     const textModels = useMemo(() => ctx.ai.listModels("text"), [ctx.ai]);
     const videoModels = useMemo(() => ctx.ai.listModels("video"), [ctx.ai]);
 
-    const setField = (key: string, value: string) => ctx.updateMetadata({ [key]: value });
+    const promptFields = new Set(["brief", "productFacts", "mustKeep", "allowedChange", "forbidden", "sound", "duration", "ratio", "lockMode"]);
+    const setField = (key: string, value: string) => ctx.updateMetadata({ [key]: value, ...(promptFields.has(key) ? { content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "" } : {}) });
     const stopCanvas = (event: { stopPropagation: () => void }) => event.stopPropagation();
     const fallback = () => buildPromptResult(draft, sourceLabel, Boolean(sourceImage));
+    const currentPromptResult = () => {
+        const storedFingerprint = metadataText(ctx.node.metadata, "promptFingerprint");
+        if (positivePrompt && storedFingerprint && storedFingerprint === promptFingerprint(draft)) {
+            return { positivePrompt, negativePrompt: metadataText(ctx.node.metadata, "negativePrompt") };
+        }
+        return fallback();
+    };
+    const currentPromptContent = () => {
+        const storedFingerprint = metadataText(ctx.node.metadata, "promptFingerprint");
+        return output && storedFingerprint && storedFingerprint === promptFingerprint(draft) ? output : fallback().content;
+    };
 
     const saveTemplate = () => {
         const result = fallback();
-        ctx.updateMetadata({ content: result.content, positivePrompt: result.positivePrompt, negativePrompt: result.negativePrompt, status: "success", errorDetails: "", copyStatus: "" });
+        ctx.updateMetadata({ content: result.content, positivePrompt: result.positivePrompt, negativePrompt: result.negativePrompt, promptFingerprint: promptFingerprint(draft), status: "success", errorDetails: "", copyStatus: "" });
     };
 
     const polishWithAi = async () => {
@@ -280,7 +362,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
         try {
             const response = await ctx.ai.generateText(buildAiPrompt(draft, base, sourceLabel, Boolean(sourceImage)), { system: AI_SYSTEM, model: draft.textModel || undefined });
             const result = parseAiResponse(response.text, base);
-            ctx.updateMetadata({ content: result.content, positivePrompt: result.positivePrompt, negativePrompt: result.negativePrompt, status: "success", errorDetails: "" });
+            ctx.updateMetadata({ content: result.content, positivePrompt: result.positivePrompt, negativePrompt: result.negativePrompt, promptFingerprint: promptFingerprint(draft), status: "success", errorDetails: "" });
         } catch (error) {
             ctx.updateMetadata({ status: "error", errorDetails: errorMessage(error) });
         } finally {
@@ -289,7 +371,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
     };
 
     const createTextOutput = () => {
-        const result = positivePrompt ? { positivePrompt } : fallback();
+        const result = currentPromptResult();
         const id = `${PLUGIN_ID}-text-${Date.now()}`;
         ctx.applyOps([
             {
@@ -312,7 +394,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
             ctx.updateMetadata({ status: "error", errorDetails: "请先把商品图片节点连接到本节点。" });
             return;
         }
-        const result = positivePrompt ? { positivePrompt, negativePrompt: metadataText(ctx.node.metadata, "negativePrompt") } : fallback();
+        const result = currentPromptResult();
         setBusy("video");
         ctx.updateMetadata({ status: "loading", errorDetails: "" });
         try {
@@ -352,6 +434,8 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
         ctx.updateMetadata({ copyStatus: ok ? "已复制" : "复制失败，请手动选择文本复制" });
         window.setTimeout(() => ctx.updateMetadata({ copyStatus: "" }), 1800);
     };
+
+    const copyNativeXaiScript = () => void copy(XAI_NATIVE_VIDEO_SCRIPT);
 
     const buttonStyle = { border: `1px solid ${ctx.theme.node.stroke}`, borderRadius: 8, background: ctx.theme.toolbar.panel, color: ctx.theme.node.text, padding: "6px 9px", cursor: "pointer", fontSize: 12 };
     const primaryButtonStyle = { ...buttonStyle, border: "1px solid #7c3aed", background: "#7c3aed", color: "#fff" };
@@ -394,14 +478,19 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                 </div>
             </div>
 
-            <details onMouseDown={stopCanvas}>
-                <summary style={{ cursor: "pointer", color: ctx.theme.node.muted, fontSize: 11 }}>商品锁定与声音（可选）</summary>
+            <details open onMouseDown={stopCanvas}>
+                <summary style={{ cursor: "pointer", color: ctx.theme.node.muted, fontSize: 11 }}>商品锁定与声音（严格首帧模式）</summary>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingTop: 7 }}>
+                    <select value={draft.lockMode} onChange={(event) => setField("lockMode", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} aria-label="商品锁定模式">
+                        <option value="strict">严格首帧：不改包装（推荐）</option>
+                        <option value="creative">创意参考：允许有限重构</option>
+                    </select>
                     <input value={draft.productFacts} placeholder="商品事实：名称、材质、颜色、包装等（只填确定事实）" onChange={(event) => setField("productFacts", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
                     <input value={draft.mustKeep} placeholder="必须保留：轮廓、logo、文字、配件……" onChange={(event) => setField("mustKeep", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
                     <input value={draft.allowedChange} placeholder="允许变化：高光、轻微镜头、蒸汽、液体等" onChange={(event) => setField("allowedChange", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
                     <input value={draft.forbidden} placeholder="额外禁止：人物、手、道具、某种变形……" onChange={(event) => setField("forbidden", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
                     <input value={draft.sound} placeholder={DEFAULT_SOUND} onChange={(event) => setField("sound", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
+                    <div style={{ color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.4 }}>严格首帧只在视频模型脚本真正使用 image-to-video 图片字段时生效；通用只发送 prompt 的视频脚本会忽略上游图片。</div>
                 </div>
             </details>
 
@@ -409,6 +498,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                 <button type="button" onMouseDown={stopCanvas} onClick={saveTemplate} style={primaryButtonStyle} disabled={busy !== null}>生成模板脚本</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={() => void polishWithAi()} style={buttonStyle} disabled={busy !== null}>{busy === "text" ? "AI润色中…" : "AI润色"}</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={createTextOutput} style={buttonStyle} disabled={busy !== null}>输出正向提示词</button>
+                <button type="button" onMouseDown={stopCanvas} onClick={copyNativeXaiScript} style={buttonStyle} disabled={busy !== null}>复制原生 xAI 脚本</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={() => void generateVideo()} style={buttonStyle} disabled={busy !== null || !sourceImage}>{busy === "video" ? "生成视频中…" : "生成视频（当前模型）"}</button>
             </div>
 
@@ -430,31 +520,31 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                     <span style={{ color: ctx.theme.node.muted, fontSize: 11 }}>脚本预览（输出资源为正向提示词）</span>
                     <div style={{ display: "flex", gap: 5 }}>
-                        <button type="button" onMouseDown={stopCanvas} onClick={() => void copy(positivePrompt || fallback().positivePrompt)} style={{ ...buttonStyle, padding: "3px 7px", fontSize: 11 }}>复制正向</button>
-                        <button type="button" onMouseDown={stopCanvas} onClick={() => void copy(output || fallback().content)} style={{ ...buttonStyle, padding: "3px 7px", fontSize: 11 }}>复制完整</button>
+                        <button type="button" onMouseDown={stopCanvas} onClick={() => void copy(currentPromptResult().positivePrompt)} style={{ ...buttonStyle, padding: "3px 7px", fontSize: 11 }}>复制正向</button>
+                        <button type="button" onMouseDown={stopCanvas} onClick={() => void copy(currentPromptContent())} style={{ ...buttonStyle, padding: "3px 7px", fontSize: 11 }}>复制完整</button>
                     </div>
                 </div>
-                <pre onWheel={stopCanvas} style={{ minHeight: 0, flex: 1, overflow: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", borderRadius: 8, padding: 9, background: ctx.theme.toolbar.panel, color: ctx.theme.node.text, fontSize: 10, lineHeight: 1.45, fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace" }}>{output || "点击“生成模板脚本”开始。\n\n提示：若要让下游视频节点拿到首帧，请同时把商品图片节点连到视频配置/生成节点。"}</pre>
+                <pre onWheel={stopCanvas} style={{ minHeight: 0, flex: 1, overflow: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", borderRadius: 8, padding: 9, background: ctx.theme.toolbar.panel, color: ctx.theme.node.text, fontSize: 10, lineHeight: 1.45, fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace" }}>{currentPromptContent()}</pre>
             </div>
         </div>
     );
 }
 
-export { buildPromptResult, buildNegativePrompt, normalizeDuration };
+export { buildPromptResult, buildNegativePrompt, normalizeDuration, promptFingerprint, XAI_NATIVE_VIDEO_SCRIPT };
 
 export default definePlugin({
     id: PLUGIN_ID,
     name: "Grok 商品图生视频",
-    version: "0.1.0",
-    description: "把商品首帧、动作目标和商品锁定规则整理成 Grok 图生视频脚本。",
+    version: "0.2.0",
+    description: "把商品首帧、动作目标和商品锁定规则整理成严格首帧 Grok 图生视频脚本，并提供原生 xAI 模型脚本。",
     nodes: [
         {
             type: `${PLUGIN_ID}:prompt`,
             title: "Grok 商品图生视频",
             icon: "🎬",
             description: "商品首帧 → 商品锁定 → 动作时间轴 → Grok 正负提示词",
-            defaultSize: { width: 520, height: 640 },
-            defaultMetadata: { brief: "", productFacts: "", mustKeep: "", allowedChange: "", forbidden: "", sound: DEFAULT_SOUND, duration: DEFAULT_DURATION, ratio: DEFAULT_RATIO, content: "", positivePrompt: "", negativePrompt: "", status: "idle" },
+            defaultSize: { width: 520, height: 720 },
+            defaultMetadata: { brief: "", productFacts: "", mustKeep: "", allowedChange: "", forbidden: "", sound: DEFAULT_SOUND, duration: DEFAULT_DURATION, ratio: DEFAULT_RATIO, lockMode: DEFAULT_LOCK_MODE, content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "", status: "idle" },
             minimapColor: "#7c3aed",
             hidePanel: true,
             resource: (node) => ({ kind: "text", text: asString(node.metadata?.positivePrompt) || asString(node.metadata?.content) }),
