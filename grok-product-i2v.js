@@ -92,6 +92,54 @@ return await poll(
   },
   { intervalMs: 5000, timeoutMs: 600000 },
 );`;
+var NEW_API_VIDEO_SCRIPT = `// New API / \u5206\u53D1\u7F51\u5173\u7248 Grok Image-to-Video\uFF1A\u4F7F\u7528 image \u5B57\u7B26\u4E32\u4F20\u5165\u9996\u5E27
+const source = images[0];
+if (!source) throw new Error("\u8BF7\u5148\u8FDE\u63A5\u5546\u54C1\u9996\u5E27\u56FE\u7247");
+
+const trimmedBaseUrl = baseUrl.replace(/\\/+$/, "");
+const apiRoot = trimmedBaseUrl.endsWith("/v1") ? trimmedBaseUrl : trimmedBaseUrl + "/v1";
+const headers = { "Content-Type": "application/json", Authorization: "Bearer " + apiKey };
+const sizeMatch = typeof params.size === "string" ? params.size.match(/^(\\d+)x(\\d+)$/) : null;
+const width = sizeMatch ? Number(sizeMatch[1]) : undefined;
+const height = sizeMatch ? Number(sizeMatch[2]) : undefined;
+
+const task = await request({
+  method: "post",
+  url: apiRoot + "/video/generations",
+  headers,
+  data: {
+    model,
+    prompt,
+    image: source,
+    duration: Number(params.seconds),
+    ...(Number.isFinite(width) ? { width } : {}),
+    ...(Number.isFinite(height) ? { height } : {}),
+  },
+});
+
+const taskId = task.task_id || task.id || task.data?.task_id || task.data?.id;
+if (!taskId) throw new Error("\u5206\u53D1\u89C6\u9891\u63A5\u53E3\u6CA1\u6709\u8FD4\u56DE task_id");
+
+return await poll(
+  () => request({
+    method: "get",
+    url: apiRoot + "/video/generations/" + taskId,
+    headers: { Authorization: "Bearer " + apiKey },
+  }),
+  (state) => {
+    const status = String(state.status || state.data?.status || "").toLowerCase();
+    if (["completed", "complete", "done", "success", "succeeded"].includes(status)) {
+      const url = state.url || state.video_url || state.video?.url || state.metadata?.url || state.data?.url || state.data?.video_url;
+      if (!url) throw new Error("\u5206\u53D1\u89C6\u9891\u4EFB\u52A1\u5B8C\u6210\u4F46\u6CA1\u6709\u8FD4\u56DE\u89C6\u9891\u5730\u5740");
+      return { url };
+    }
+    if (["failed", "error", "expired", "cancelled", "canceled"].includes(status)) {
+      throw new Error(state.error?.message || state.data?.error?.message || state.message || "\u5206\u53D1\u89C6\u9891\u4EFB\u52A1 " + status);
+    }
+    return null;
+  },
+  { intervalMs: 5000, timeoutMs: 600000 },
+);`;
 var AI_SYSTEM = `\u4F60\u662F\u5546\u54C1\u56FE\u751F\u89C6\u9891\u63D0\u793A\u8BCD\u7F16\u5BFC\u3002\u4F60\u53EA\u80FD\u4F9D\u636E\u7528\u6237\u63D0\u4F9B\u7684\u4E8B\u5B9E\u548C\u201C\u9996\u5E27\u5546\u54C1\u56FE\u4F5C\u4E3A\u552F\u4E00\u5546\u54C1\u4E8B\u5B9E\u57FA\u51C6\u201D\u6765\u5199\u63D0\u793A\u8BCD\uFF0C\u4E0D\u8981\u81C6\u6D4B\u54C1\u724C\u3001\u578B\u53F7\u3001\u6750\u8D28\u3001\u80CC\u9762\u3001\u5E95\u90E8\u3001\u5185\u90E8\u7ED3\u6784\u6216\u4E0D\u53EF\u89C1\u6587\u5B57\u3002
 
 \u5FC5\u987B\u9075\u5B88\uFF1A
@@ -832,6 +880,7 @@ function GrokProductI2VContent({ ctx }) {
     window.setTimeout(() => ctx.updateMetadata({ copyStatus: "" }), 1800);
   };
   const copyNativeXaiScript = () => void copy(XAI_NATIVE_VIDEO_SCRIPT);
+  const copyNewApiScript = () => void copy(NEW_API_VIDEO_SCRIPT);
   const buttonStyle = { border: `1px solid ${ctx.theme.node.stroke}`, borderRadius: 8, background: ctx.theme.toolbar.panel, color: ctx.theme.node.text, padding: "6px 9px", cursor: "pointer", fontSize: 12 };
   const primaryButtonStyle = { ...buttonStyle, border: "1px solid #7c3aed", background: "#7c3aed", color: "#fff" };
   const inputStyle = { width: "100%", boxSizing: "border-box", border: `1px solid ${ctx.theme.node.stroke}`, borderRadius: 7, background: ctx.theme.node.panel, color: ctx.theme.node.text, padding: "7px 8px", fontSize: 12, outline: "none" };
@@ -905,6 +954,7 @@ function GrokProductI2VContent({ ctx }) {
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: createTextOutput, style: buttonStyle, disabled: busy !== null, children: "\u8F93\u51FA\u6B63\u5411\u63D0\u793A\u8BCD" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: createQualityChecklist, style: buttonStyle, disabled: busy !== null, children: "\u8F93\u51FA\u8D28\u68C0\u6E05\u5355" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: copyNativeXaiScript, style: buttonStyle, disabled: busy !== null, children: "\u590D\u5236\u539F\u751F xAI \u811A\u672C" }),
+      /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: copyNewApiScript, style: buttonStyle, disabled: busy !== null, children: "\u590D\u5236 New API \u5206\u53D1\u811A\u672C" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void generateVideo(), style: buttonStyle, disabled: busy !== null || !sourceImage, children: busy === "video" ? "\u5355\u955C\u5934\u751F\u6210\u4E2D\u2026" : "\u751F\u6210\u5355\u955C\u5934\u89C6\u9891\uFF08\u539F\u5546\u54C1\u9996\u5E27\uFF09" })
     ] }),
     /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }, children: [
@@ -939,7 +989,7 @@ function GrokProductI2VContent({ ctx }) {
 var index_default = definePlugin({
   id: PLUGIN_ID,
   name: "Grok \u5546\u54C1\u56FE\u751F\u89C6\u9891",
-  version: "0.3.0",
+  version: "0.4.0",
   description: "\u628A\u5546\u54C1\u56FE\u548C\u6548\u679C\u63CF\u8FF0\u62C6\u6210\u811A\u672C\u3001\u5206\u955C\u9996\u5E27\u4E0E Grok \u9010\u955C\u5934\u56FE\u751F\u89C6\u9891\uFF0C\u5E76\u63D0\u4F9B\u5546\u54C1/\u4EBA\u7269\u4E00\u81F4\u6027\u7EA6\u675F\u4E0E\u8D28\u68C0\u6E05\u5355\u3002",
   nodes: [
     {
@@ -957,6 +1007,7 @@ var index_default = definePlugin({
   ]
 });
 export {
+  NEW_API_VIDEO_SCRIPT,
   XAI_NATIVE_VIDEO_SCRIPT,
   buildNegativePrompt,
   buildPromptResult,

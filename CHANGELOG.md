@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0
+
+- 新增 New API / 分发网关专用视频脚本：使用 `POST /v1/video/generations`、`image` 字符串和 `GET /v1/video/generations/{task_id}`。
+- 新增“复制 New API 分发脚本”按钮，保留原生 xAI 脚本，避免把两种接口格式混用。
+
 ## 0.3.0
 
 - 新增“脚本规划 → 分镜首帧图 → Grok 逐镜头视频”的一键工作流。

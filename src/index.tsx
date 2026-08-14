@@ -113,6 +113,55 @@ return await poll(
   { intervalMs: 5000, timeoutMs: 600000 },
 );`;
 
+const NEW_API_VIDEO_SCRIPT = `// New API / 分发网关版 Grok Image-to-Video：使用 image 字符串传入首帧
+const source = images[0];
+if (!source) throw new Error("请先连接商品首帧图片");
+
+const trimmedBaseUrl = baseUrl.replace(/\\/+$/, "");
+const apiRoot = trimmedBaseUrl.endsWith("/v1") ? trimmedBaseUrl : trimmedBaseUrl + "/v1";
+const headers = { "Content-Type": "application/json", Authorization: "Bearer " + apiKey };
+const sizeMatch = typeof params.size === "string" ? params.size.match(/^(\\d+)x(\\d+)$/) : null;
+const width = sizeMatch ? Number(sizeMatch[1]) : undefined;
+const height = sizeMatch ? Number(sizeMatch[2]) : undefined;
+
+const task = await request({
+  method: "post",
+  url: apiRoot + "/video/generations",
+  headers,
+  data: {
+    model,
+    prompt,
+    image: source,
+    duration: Number(params.seconds),
+    ...(Number.isFinite(width) ? { width } : {}),
+    ...(Number.isFinite(height) ? { height } : {}),
+  },
+});
+
+const taskId = task.task_id || task.id || task.data?.task_id || task.data?.id;
+if (!taskId) throw new Error("分发视频接口没有返回 task_id");
+
+return await poll(
+  () => request({
+    method: "get",
+    url: apiRoot + "/video/generations/" + taskId,
+    headers: { Authorization: "Bearer " + apiKey },
+  }),
+  (state) => {
+    const status = String(state.status || state.data?.status || "").toLowerCase();
+    if (["completed", "complete", "done", "success", "succeeded"].includes(status)) {
+      const url = state.url || state.video_url || state.video?.url || state.metadata?.url || state.data?.url || state.data?.video_url;
+      if (!url) throw new Error("分发视频任务完成但没有返回视频地址");
+      return { url };
+    }
+    if (["failed", "error", "expired", "cancelled", "canceled"].includes(status)) {
+      throw new Error(state.error?.message || state.data?.error?.message || state.message || "分发视频任务 " + status);
+    }
+    return null;
+  },
+  { intervalMs: 5000, timeoutMs: 600000 },
+);`;
+
 const AI_SYSTEM = `你是商品图生视频提示词编导。你只能依据用户提供的事实和“首帧商品图作为唯一商品事实基准”来写提示词，不要臆测品牌、型号、材质、背面、底部、内部结构或不可见文字。
 
 必须遵守：
@@ -925,6 +974,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
     };
 
     const copyNativeXaiScript = () => void copy(XAI_NATIVE_VIDEO_SCRIPT);
+    const copyNewApiScript = () => void copy(NEW_API_VIDEO_SCRIPT);
 
     const buttonStyle = { border: `1px solid ${ctx.theme.node.stroke}`, borderRadius: 8, background: ctx.theme.toolbar.panel, color: ctx.theme.node.text, padding: "6px 9px", cursor: "pointer", fontSize: 12 };
     const primaryButtonStyle = { ...buttonStyle, border: "1px solid #7c3aed", background: "#7c3aed", color: "#fff" };
@@ -1015,6 +1065,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                 <button type="button" onMouseDown={stopCanvas} onClick={createTextOutput} style={buttonStyle} disabled={busy !== null}>输出正向提示词</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={createQualityChecklist} style={buttonStyle} disabled={busy !== null}>输出质检清单</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={copyNativeXaiScript} style={buttonStyle} disabled={busy !== null}>复制原生 xAI 脚本</button>
+                <button type="button" onMouseDown={stopCanvas} onClick={copyNewApiScript} style={buttonStyle} disabled={busy !== null}>复制 New API 分发脚本</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={() => void generateVideo()} style={buttonStyle} disabled={busy !== null || !sourceImage}>{busy === "video" ? "单镜头生成中…" : "生成单镜头视频（原商品首帧）"}</button>
             </div>
 
@@ -1051,12 +1102,12 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
     );
 }
 
-export { buildPromptResult, buildNegativePrompt, normalizeDuration, normalizeSceneCount, promptFingerprint, storyboardFingerprint, buildStoryboardFallback, buildStoryboardAiPrompt, parseStoryboardResponse, buildSceneVideoPrompt, XAI_NATIVE_VIDEO_SCRIPT };
+export { buildPromptResult, buildNegativePrompt, normalizeDuration, normalizeSceneCount, promptFingerprint, storyboardFingerprint, buildStoryboardFallback, buildStoryboardAiPrompt, parseStoryboardResponse, buildSceneVideoPrompt, XAI_NATIVE_VIDEO_SCRIPT, NEW_API_VIDEO_SCRIPT };
 
 export default definePlugin({
     id: PLUGIN_ID,
     name: "Grok 商品图生视频",
-    version: "0.3.0",
+    version: "0.4.0",
     description: "把商品图和效果描述拆成脚本、分镜首帧与 Grok 逐镜头图生视频，并提供商品/人物一致性约束与质检清单。",
     nodes: [
         {

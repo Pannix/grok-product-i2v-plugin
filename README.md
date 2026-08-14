@@ -10,7 +10,7 @@
 风格图 ──┘                         └─> 质检清单
 ```
 
-0.3.0 把流程扩展为“脚本规划 → 分镜图 → Grok 图生视频 → 质检”。第 1 张上游图片固定为商品图，第 2 张可作为人物身份参考，第 3 张可作为风格参考。分镜图先用图生图模型生成并落到画布，视频阶段再把每张分镜图作为 Grok image-to-video 的实际首帧，按镜头逐个生成。
+0.4.0 增加 New API / 分发网关视频脚本；0.3.0 把流程扩展为“脚本规划 → 分镜图 → Grok 图生视频 → 质检”。第 1 张上游图片固定为商品图，第 2 张可作为人物身份参考，第 3 张可作为风格参考。分镜图先用图生图模型生成并落到画布，视频阶段再把每张分镜图作为 Grok image-to-video 的实际首帧，按镜头逐个生成。
 
 插件不会把提示词效果说成绝对保证：Grok 仍可能改写包装文字、改变脸型或产生穿模，因此默认把镜头拆短、限制每镜头一个动作，并输出逐镜头质检清单。需要“像素级商品包装/人物身份”时，应使用真实商品层或具备 IP-Adapter / FaceID / ControlNet 的图像工作流先做合格静帧，再交给 Grok 动画。
 
@@ -79,6 +79,16 @@ image: { url: images[0] }
 
 后者会退化为文字生视频，模型可能知道“这是姜枣茶”，却自行重做成一个纸盒。xAI 官方 Image-to-Video 接口使用 `image` 字段作为源图起始帧：[官方文档](https://docs.x.ai/developers/model-capabilities/video/image-to-video)。
 
+如果你的渠道是 `https://api.aicopy.top/v1` 这类 New API / 分发网关，请不要粘贴上面的原生 xAI 脚本。点击节点里的「复制 New API 分发脚本」，粘贴到该分发渠道对应的视频模型脚本中。这个脚本使用网关格式：
+
+```text
+POST /v1/video/generations
+GET  /v1/video/generations/{task_id}
+image: images[0]
+```
+
+画布模型配置里的 Base URL 保持为 `https://api.aicopy.top/v1`，模型名使用该分发渠道模型列表中显示的完整名称；不要把 `grok-imagine-video-1.5-fast`、`grok-imagine-video-1.5-preview` 等名称互相替换，除非它们确实出现在该渠道的模型列表中。New API 的公开视频接口文档见：[创建视频任务](https://docs.newapi.pro/zh/docs/api/ai-model/videos/createvideogeneration) 和 [查询视频任务](https://docs.newapi.pro/zh/docs/api/ai-model/videos/getvideogeneration)。
+
 ### 分镜图模型也要支持图生图
 
 「一键生成脚本与分镜图」会把商品、人物和风格参考图传给画布的图像生成接口，因此当前选中的图像模型必须支持 image-to-image / image edit。若图像模型脚本只发送 `prompt` 而没有读取 `images`，分镜图也会退化为文字生图，商品包装可能被重画。
@@ -90,6 +100,7 @@ image: { url: images[0] }
 - 当前公开 SDK 的 `generateText` 接口没有图片参数，因此脚本规划只读取用户目标和手填事实；真正的商品/人物参考图会在分镜图生成阶段传给图像模型。不要把文本模型的“看图分析”当成已发生的事实。
 - 分镜图生成后，视频阶段只把对应分镜图作为 Grok image-to-video 的 `image` 首帧。这样比把商品图放进 `reference_images` 更适合锁定第 0 帧；xAI 官方说明 reference-to-video 会影响内容但不锁定首帧：[官方说明](https://docs.x.ai/developers/model-capabilities/video/reference-to-video)。
 - 「一键生成视频（全部分镜）」调用的是 canvas.best 当前配置的视频模型，不会自动保证模型就是 Grok。若要实际调用 Grok，需要在画布设置里配置兼容 xAI 的视频模型/接口，并把原生脚本粘贴到对应模型配置。
+- 分发网关能否真正调用 Grok，还取决于渠道是否为所选模型配置了可用的上游路由、余额和权限；插件只负责按网关协议传递首帧，不会把一个没有视频上游的模型变成可用模型。
 - 商品包装文字、logo、人物脸型和穿模属于生成模型风险，不存在只靠提示词的 100% 保证。插件通过参考图分工、短镜头、单动作、首帧锁定和质检清单降低风险；失败镜头应单独重生成。
 - 如果分镜图已经把商品包装或人物脸型画错，后续 Grok 只会把错误首帧动画化，不会自动把它修回真实商品；必须先重新生成/修正分镜图。
 - 本节点仍保留「生成单镜头视频（原商品首帧）」作为最强商品身份测试。它适合没有人物或不需要复杂场景的镜头；要同时出现人物和商品，必须接受图生图首帧仍可能需要人工筛选。
