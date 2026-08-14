@@ -127,10 +127,41 @@ return await poll(
     headers: { Authorization: "Bearer " + apiKey },
   }),
   (state) => {
-    const status = String(state.status || state.data?.status || "").toLowerCase();
+    const status = String(state.status || state.data?.status || state.data?.data?.status || "").toLowerCase();
     if (["completed", "complete", "done", "success", "succeeded"].includes(status)) {
-      const url = state.url || state.video_url || state.video?.url || state.metadata?.url || state.data?.url || state.data?.video_url;
-      if (!url) throw new Error("\u5206\u53D1\u89C6\u9891\u4EFB\u52A1\u5B8C\u6210\u4F46\u6CA1\u6709\u8FD4\u56DE\u89C6\u9891\u5730\u5740");
+      const firstUrl = (...values) => values.find((value) => typeof value === "string" && value.trim())?.trim();
+      const urlValue = firstUrl(
+        state.url,
+        state.video_url,
+        state.result_url,
+        state.content_url,
+        state.content,
+        state.video?.url,
+        state.content?.video_url,
+        state.content?.url,
+        state.metadata?.url,
+        state.metadata?.result_url,
+        state.metadata?.result_urls?.[0],
+        state.data?.url,
+        state.data?.video_url,
+        state.data?.result_url,
+        state.data?.content_url,
+        state.data?.content,
+        state.data?.content?.video_url,
+        state.data?.content?.url,
+        state.data?.data?.url,
+        state.data?.data?.video_url,
+        state.data?.data?.result_url,
+        state.data?.data?.content?.video_url,
+        state.data?.data?.content?.url,
+      );
+      if (!urlValue) {
+        const topLevelKeys = state && typeof state === "object" ? Object.keys(state).join(", ") : "";
+        const dataKeys = state?.data && typeof state.data === "object" ? Object.keys(state.data).join(", ") : "";
+        throw new Error("\u5206\u53D1\u89C6\u9891\u4EFB\u52A1\u5B8C\u6210\u4F46\u6CA1\u6709\u8FD4\u56DE\u89C6\u9891\u5730\u5740\uFF1B\u8FD4\u56DE\u5B57\u6BB5\uFF1A" + topLevelKeys + (dataKeys ? "\uFF1Bdata \u5B57\u6BB5\uFF1A" + dataKeys : ""));
+      }
+      let url = urlValue;
+      try { url = new URL(urlValue, apiRoot).toString(); } catch {}
       return { url };
     }
     if (["failed", "error", "expired", "cancelled", "canceled"].includes(status)) {
@@ -989,7 +1020,7 @@ function GrokProductI2VContent({ ctx }) {
 var index_default = definePlugin({
   id: PLUGIN_ID,
   name: "Grok \u5546\u54C1\u56FE\u751F\u89C6\u9891",
-  version: "0.4.0",
+  version: "0.4.1",
   description: "\u628A\u5546\u54C1\u56FE\u548C\u6548\u679C\u63CF\u8FF0\u62C6\u6210\u811A\u672C\u3001\u5206\u955C\u9996\u5E27\u4E0E Grok \u9010\u955C\u5934\u56FE\u751F\u89C6\u9891\uFF0C\u5E76\u63D0\u4F9B\u5546\u54C1/\u4EBA\u7269\u4E00\u81F4\u6027\u7EA6\u675F\u4E0E\u8D28\u68C0\u6E05\u5355\u3002",
   nodes: [
     {

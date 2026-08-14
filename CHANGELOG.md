@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+- 扩展分发网关完成响应的视频地址解析，兼容 `result_url`、`content.video_url`、嵌套 `data` 等字段。
+- 找不到视频地址时显示响应字段名，便于区分网关返回结构和任务生成失败。
+
 ## 0.4.0
 
 - 新增 New API / 分发网关专用视频脚本：使用 `POST /v1/video/generations`、`image` 字符串和 `GET /v1/video/generations/{task_id}`。

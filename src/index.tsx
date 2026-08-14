@@ -148,10 +148,41 @@ return await poll(
     headers: { Authorization: "Bearer " + apiKey },
   }),
   (state) => {
-    const status = String(state.status || state.data?.status || "").toLowerCase();
+    const status = String(state.status || state.data?.status || state.data?.data?.status || "").toLowerCase();
     if (["completed", "complete", "done", "success", "succeeded"].includes(status)) {
-      const url = state.url || state.video_url || state.video?.url || state.metadata?.url || state.data?.url || state.data?.video_url;
-      if (!url) throw new Error("分发视频任务完成但没有返回视频地址");
+      const firstUrl = (...values) => values.find((value) => typeof value === "string" && value.trim())?.trim();
+      const urlValue = firstUrl(
+        state.url,
+        state.video_url,
+        state.result_url,
+        state.content_url,
+        state.content,
+        state.video?.url,
+        state.content?.video_url,
+        state.content?.url,
+        state.metadata?.url,
+        state.metadata?.result_url,
+        state.metadata?.result_urls?.[0],
+        state.data?.url,
+        state.data?.video_url,
+        state.data?.result_url,
+        state.data?.content_url,
+        state.data?.content,
+        state.data?.content?.video_url,
+        state.data?.content?.url,
+        state.data?.data?.url,
+        state.data?.data?.video_url,
+        state.data?.data?.result_url,
+        state.data?.data?.content?.video_url,
+        state.data?.data?.content?.url,
+      );
+      if (!urlValue) {
+        const topLevelKeys = state && typeof state === "object" ? Object.keys(state).join(", ") : "";
+        const dataKeys = state?.data && typeof state.data === "object" ? Object.keys(state.data).join(", ") : "";
+        throw new Error("分发视频任务完成但没有返回视频地址；返回字段：" + topLevelKeys + (dataKeys ? "；data 字段：" + dataKeys : ""));
+      }
+      let url = urlValue;
+      try { url = new URL(urlValue, apiRoot).toString(); } catch {}
       return { url };
     }
     if (["failed", "error", "expired", "cancelled", "canceled"].includes(status)) {
@@ -1107,7 +1138,7 @@ export { buildPromptResult, buildNegativePrompt, normalizeDuration, normalizeSce
 export default definePlugin({
     id: PLUGIN_ID,
     name: "Grok 商品图生视频",
-    version: "0.4.0",
+    version: "0.4.1",
     description: "把商品图和效果描述拆成脚本、分镜首帧与 Grok 逐镜头图生视频，并提供商品/人物一致性约束与质检清单。",
     nodes: [
         {
