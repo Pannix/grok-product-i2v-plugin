@@ -12,7 +12,10 @@ type Draft = {
     ratio: string;
     lockMode: string;
     textModel: string;
+    imageModel: string;
     videoModel: string;
+    sceneCount: string;
+    characterMode: string;
 };
 
 type PromptResult = {
@@ -21,11 +24,39 @@ type PromptResult = {
     negativePrompt: string;
 };
 
+type StoryboardScene = {
+    id: string;
+    title: string;
+    purpose: string;
+    duration: string;
+    framePrompt: string;
+    videoPrompt: string;
+    negativePrompt: string;
+    imageNodeId?: string;
+};
+
+type StoryboardPlan = {
+    title: string;
+    summary: string;
+    productLock: string;
+    characterLock: string;
+    continuity: string;
+    scenes: StoryboardScene[];
+};
+
+type InputImage = {
+    node: CanvasNodeData;
+    content: string;
+    title: string;
+};
+
 const PLUGIN_ID = "grok-product-i2v";
 const DEFAULT_DURATION = "6";
 const DEFAULT_RATIO = "保持首帧画幅";
 const DEFAULT_LOCK_MODE = "strict";
 const DEFAULT_SOUND = "轻微真实环境声或材质摩擦声；不要旁白、不要台词、不要音乐抢主体。";
+const DEFAULT_SCENE_COUNT = "3";
+const DEFAULT_CHARACTER_MODE = "product-only";
 
 const XAI_NATIVE_VIDEO_SCRIPT = `// 原生 xAI Grok Image-to-Video：必须把首帧放进 image 字段
 const source = images[0];
@@ -94,6 +125,18 @@ const AI_SYSTEM = `你是商品图生视频提示词编导。你只能依据用�
 请只返回严格 JSON，不要 Markdown 代码围栏：
 {"positivePrompt":"可直接给 Grok 图生视频模型的正向提示词","negativePrompt":"逗号分隔的动态负面提示词","scriptMarkdown":"完整中文脚本，包含目标、设置、首帧/商品锁定、时间轴、镜头、声音、正向提示词和动态负面提示词"}`;
 
+const STORYBOARD_SYSTEM = `你是商品广告的分镜编导。请把用户的商品展示目标拆成 2 到 4 个短镜头，每个镜头只承担一个主要任务。
+
+规则：
+1. 商品参考图是商品身份、包装、轮廓、颜色、比例、logo、可见文字和材质的唯一事实基准；不得创造或改写商品事实。
+2. 如果启用人物锁定，人物参考图只用于保持同一人的脸型、五官比例、发型和外观，不要凭空改变人物身份；人物参考图缺失时，不要声称脸型已锁定。
+3. 每个镜头必须给出可生成的静态分镜首帧提示词，以及只描述后续变化的 Grok 图生视频动作提示词。静态图负责构图、光线和身份，视频提示词只负责动作、镜头变化和声音。
+4. 每个镜头只安排一个主动作，尽量使用 2 到 6 秒的短镜头；明确手、人物、商品的接触关系，避免遮挡、穿模和不可能的物理关系。
+5. 不要补写首帧没有展示的商品背面、底部、内部结构或不可读文字；不要生成字幕、水印、第二个商品或新的包装版式。
+
+只返回严格 JSON，不要 Markdown 代码围栏：
+{"title":"短片标题","summary":"整体叙事","productLock":"商品锁定规则","characterLock":"人物锁定规则","continuity":"镜头间连续性规则","scenes":[{"id":"s1","title":"镜头标题","purpose":"镜头任务","duration":"4","framePrompt":"分镜静帧提示词","videoPrompt":"只描述从该静帧开始发生的动作、镜头和声音","negativePrompt":"针对本镜头的动态负面提示词"}]}`;
+
 function asString(value: unknown, fallback = "") {
     return typeof value === "string" ? value : fallback;
 }
@@ -122,7 +165,10 @@ function readDraft(ctx: CanvasNodeContentProps["ctx"]): Draft {
         ratio: metadataText(metadata, "ratio", DEFAULT_RATIO),
         lockMode: metadataText(metadata, "lockMode", DEFAULT_LOCK_MODE),
         textModel: metadataText(metadata, "textModel"),
+        imageModel: metadataText(metadata, "imageModel"),
         videoModel: metadataText(metadata, "videoModel"),
+        sceneCount: normalizeSceneCount(metadataText(metadata, "sceneCount", DEFAULT_SCENE_COUNT)),
+        characterMode: metadataText(metadata, "characterMode", DEFAULT_CHARACTER_MODE),
     };
 }
 
@@ -133,13 +179,33 @@ function isImageNode(node: CanvasNodeData) {
 }
 
 function findFirstImage(ctx: CanvasNodeContentProps["ctx"]) {
-    return ctx.getUpstream().find((node) => isImageNode(node) && Boolean(asString(node.metadata?.content))) || null;
+    return findInputImages(ctx)[0]?.node || null;
+}
+
+function findInputImages(ctx: CanvasNodeContentProps["ctx"]): InputImage[] {
+    return ctx
+        .getUpstream()
+        .filter((node) => isImageNode(node))
+        .map((node) => ({ node, content: asString(node.metadata?.content), title: node.title || "图片参考" }))
+        .filter((item) => Boolean(item.content));
 }
 
 function normalizeDuration(value: string) {
     const parsed = Number.parseFloat(value);
     if (!Number.isFinite(parsed)) return DEFAULT_DURATION;
     return String(Math.min(15, Math.max(2, Math.round(parsed))));
+}
+
+function normalizeSceneCount(value: string) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed)) return DEFAULT_SCENE_COUNT;
+    return String(Math.min(4, Math.max(2, parsed)));
+}
+
+function normalizeSceneDuration(value: string, fallback = "4") {
+    const parsed = Number.parseFloat(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return String(Math.min(10, Math.max(2, Math.round(parsed))));
 }
 
 function ratioInstruction(ratio: string) {
@@ -187,7 +253,217 @@ function splitLines(value: string) {
 }
 
 function promptFingerprint(draft: Draft) {
-    return [draft.brief, draft.productFacts, draft.mustKeep, draft.allowedChange, draft.forbidden, draft.sound, draft.duration, draft.ratio, draft.lockMode].join("\u241f");
+    return [draft.brief, draft.productFacts, draft.mustKeep, draft.allowedChange, draft.forbidden, draft.sound, draft.duration, draft.ratio, draft.lockMode, draft.sceneCount, draft.characterMode].join("\u241f");
+}
+
+function storyboardFingerprint(draft: Draft) {
+    return `${promptFingerprint(draft)}\u241f${draft.imageModel}`;
+}
+
+function characterLockText(draft: Draft, hasCharacterReference: boolean) {
+    if (draft.characterMode === "product-only") return "本项目不安排人物；不要新增人物、手或人物道具。";
+    if (draft.characterMode === "strict-person" && hasCharacterReference) return "使用第二张上游人物参考图锁定同一人物的脸型、五官比例、发型、肤色和整体身份；人物动作可以变化，脸部结构不要变化。";
+    if (draft.characterMode === "strict-person") return "用户要求人物一致，但未连接第二张人物参考图；无法建立可靠的人物身份锁定，必须先补充人物参考图。";
+    return "允许出现人物，但未启用人物身份锁定；不要把此模式描述为脸型一致保证。";
+}
+
+function sceneDuration(totalDuration: string, index: number, count: number) {
+    const total = Number(totalDuration);
+    if (!Number.isFinite(total)) return "4";
+    const base = Math.max(2, Math.round(total / count));
+    if (index === count - 1) return normalizeSceneDuration(String(Math.max(2, total - base * (count - 1))), String(base));
+    return normalizeSceneDuration(String(base), "4");
+}
+
+function buildStoryboardFallback(draft: Draft, hasCharacterReference: boolean): StoryboardPlan {
+    const count = Number(normalizeSceneCount(draft.sceneCount));
+    const action = primaryAction(draft.brief);
+    const characterLock = characterLockText(draft, hasCharacterReference);
+    const usesPerson = draft.characterMode !== "product-only" && hasCharacterReference;
+    const scenes: StoryboardScene[] = [
+        {
+            id: "s1",
+            title: "商品建立镜头",
+            purpose: "先让观众看清商品主体、包装和整体质感。",
+            duration: sceneDuration(draft.duration, 0, count),
+            framePrompt: "以商品参考图为唯一商品身份基准，保持原包装、轮廓、比例、颜色、可见文字和原有构图关系，建立干净的商业展示首帧；只添加与用户目标一致的环境光影，不改商品。",
+            videoPrompt: "先保持首帧静止约 0.8 秒，然后让光线或极轻微镜头变化自然出现，商品边缘和包装文字持续稳定；最后回到稳定展示。",
+            negativePrompt: "商品改款，包装重绘，文字乱码，新增第二个商品，镜头跳动，商品漂浮，边缘闪烁",
+        },
+        {
+            id: "s2",
+            title: "核心动作镜头",
+            purpose: "用一个主动作表达用户想要的效果。",
+            duration: sceneDuration(draft.duration, 1, count),
+            framePrompt: `${usesPerson ? "人物参考图中的同一人物出现在画面中，脸型和五官比例保持一致；" : "不新增人物；"}商品参考图仍是商品身份唯一基准，安排一个明确、克制、可执行的展示场景。主动作目标：${action}。商品与人物/手的接触关系必须清楚、符合物理空间，不遮挡商品关键包装文字。`,
+            videoPrompt: `${usesPerson ? "同一人物保持脸型、五官比例和发型稳定；" : "画面中不出现新增人物或手；"}只执行一个主动作：${action}。动作慢、连续、可观察，手与商品保持真实接触关系，不穿过商品，不让商品穿过手或人物；镜头只做轻微连续运动。`,
+            negativePrompt: "脸型漂移，五官跳变，手指畸形，手穿过商品，商品穿过手，遮挡logo，商品变形，动作跳切",
+        },
+        {
+            id: "s3",
+            title: "稳定收尾镜头",
+            purpose: "回到清晰的商品英雄画面，方便后期剪辑和转化。",
+            duration: sceneDuration(draft.duration, 2, count),
+            framePrompt: "商品参考图中的商品保持原样，形成清晰、稳定、可读的收尾英雄帧；保留商品原有包装正面和可见文字，不新增口号、字幕、水印或第二个商品。",
+            videoPrompt: "主动作自然收尾，镜头停止在稳定的商品英雄画面；保持商品轮廓、包装文字、logo、材质纹理和光影连续，最后约 0.8 秒不要再引入新动作。",
+            negativePrompt: "改包装，文字变形，logo变形，商品融化，商品重复，画面闪烁，突然变焦，字幕水印",
+        },
+        {
+            id: "s4",
+            title: "细节补充镜头",
+            purpose: "用一个局部但仍可辨识的细节强化商品卖点，不改变商品身份。",
+            duration: sceneDuration(draft.duration, 3, count),
+            framePrompt: "保持商品参考图中可见的商品身份和包装事实，只选择原图已经展示的一个局部细节作为视觉重点；不要创造新的内部结构、背面或不可读文字，不要把局部变成另一个商品。",
+            videoPrompt: "镜头做很小幅、平滑的推近或光影变化，展示原图可见的局部细节后回到稳定状态；商品表面纹理连续，包装文字和轮廓不漂移。",
+            negativePrompt: "局部变成新商品，包装文字乱码，材质液化，结构穿模，过度微距，镜头跳动，突然变焦",
+        },
+    ];
+    const selectedScenes = count === 2 ? [scenes[0], scenes[1]] : scenes.slice(0, count);
+    return {
+        title: "商品图生视频分镜",
+        summary: draft.brief || "以商品主体稳定展示为主，先建立商品，再完成一个核心动作，最后稳定收尾。",
+        productLock: draft.mustKeep || "商品身份、轮廓、比例、颜色、材质、包装、配件、logo、可见文字和原有画面关系必须保持。",
+        characterLock,
+        continuity: "每个镜头使用已确认的分镜静帧作为 Grok image-to-video 首帧；镜头之间只延续已确认的商品和人物外观，不凭空补全不可见结构。",
+        scenes: selectedScenes,
+    };
+}
+
+function buildStoryboardAiPrompt(draft: Draft, fallback: StoryboardPlan, hasCharacterReference: boolean) {
+    return [
+        `请生成 ${draft.sceneCount} 个商品广告短镜头的结构化分镜。`,
+        `用户想要的效果：${draft.brief || "稳定展示商品材质与轮廓"}`,
+        `商品事实：${draft.productFacts || "没有额外事实，只以商品参考图中实际可见内容为准"}`,
+        `必须保留：${draft.mustKeep || "商品参考图中的身份、包装、轮廓、比例和可见文字"}`,
+        `允许变化：${draft.allowedChange || "单一主动作、轻微镜头运动和自然光影变化"}`,
+        `禁止内容：${draft.forbidden || "改包装、改文字、增加第二个商品、结构漂移、穿模"}`,
+        `画幅：${draft.ratio}；总时长参考：${draft.duration} 秒。`,
+        `人物模式：${draft.characterMode}；人物参考图是否已连接：${hasCharacterReference ? "是" : "否"}。`,
+        `人物锁定规则：${characterLockText(draft, hasCharacterReference)}`,
+        "请遵守：每个镜头只做一个主要任务；framePrompt 是静态分镜首帧，必须强调商品/人物身份和接触关系；videoPrompt 只描述从该静帧开始发生的动作、镜头和声音，不要重新发明构图或商品；negativePrompt 只写本镜头最可能出现的错误。",
+        "以下是保守模板，若输入事实不足请沿用，不要补充未展示的商品细节：",
+        JSON.stringify(fallback),
+    ].join("\n");
+}
+
+function normalizeStoryboardScene(value: unknown, index: number, fallback: StoryboardScene): StoryboardScene {
+    const item = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+    return {
+        id: asString(item.id, fallback.id) || `s${index + 1}`,
+        title: asString(item.title, fallback.title) || fallback.title,
+        purpose: asString(item.purpose, fallback.purpose) || fallback.purpose,
+        duration: normalizeSceneDuration(asString(item.duration, fallback.duration), fallback.duration),
+        framePrompt: asString(item.framePrompt, fallback.framePrompt) || fallback.framePrompt,
+        videoPrompt: asString(item.videoPrompt, fallback.videoPrompt) || fallback.videoPrompt,
+        negativePrompt: asString(item.negativePrompt, fallback.negativePrompt) || fallback.negativePrompt,
+    };
+}
+
+function parseStoryboardResponse(text: string, fallback: StoryboardPlan): StoryboardPlan {
+    const trimmed = text.trim();
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    if (start < 0 || end <= start) return fallback;
+    try {
+        const parsed = JSON.parse(trimmed.slice(start, end + 1)) as Record<string, unknown>;
+        const rawScenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
+        if (rawScenes.length < 2) return fallback;
+        const scenes = rawScenes.slice(0, 4).map((scene, index) => normalizeStoryboardScene(scene, index, fallback.scenes[index] || fallback.scenes[fallback.scenes.length - 1]));
+        return {
+            title: asString(parsed.title, fallback.title) || fallback.title,
+            summary: asString(parsed.summary, fallback.summary) || fallback.summary,
+            productLock: asString(parsed.productLock, fallback.productLock) || fallback.productLock,
+            characterLock: asString(parsed.characterLock, fallback.characterLock) || fallback.characterLock,
+            continuity: asString(parsed.continuity, fallback.continuity) || fallback.continuity,
+            scenes,
+        };
+    } catch {
+        return fallback;
+    }
+}
+
+function parseStoredStoryboard(value: unknown): StoryboardPlan | null {
+    if (typeof value !== "string" || !value.trim()) return null;
+    try {
+        const parsed = JSON.parse(value) as StoryboardPlan;
+        if (!parsed || !Array.isArray(parsed.scenes) || parsed.scenes.length < 2) return null;
+        return parsed;
+    } catch {
+        return null;
+    }
+}
+
+function storyboardReferences(inputs: InputImage[], draft: Draft) {
+    const refs = [inputs[0]?.content].filter(Boolean) as string[];
+    if (draft.characterMode === "product-only") {
+        if (inputs[1]?.content) refs.push(inputs[1].content);
+    } else {
+        if (inputs[1]?.content) refs.push(inputs[1].content);
+        if (inputs[2]?.content) refs.push(inputs[2].content);
+    }
+    return refs;
+}
+
+function buildSceneFramePrompt(scene: StoryboardScene, draft: Draft, hasCharacterReference: boolean) {
+    return [
+        "生成一张商品广告分镜静帧，不要生成视频，不要拼贴多个镜头。",
+        "第一张参考图是商品身份的唯一事实基准：必须保持商品原包装、logo、可见文字、轮廓、比例、颜色、材质、配件和关键细节，不改款、不换包装、不重新设计正面版式。",
+        draft.characterMode === "strict-person" && hasCharacterReference
+            ? "第二张参考图是人物身份基准：保持同一人物的脸型、五官比例、发型、肤色和整体身份；不要变脸、换人或改变头身比例。"
+            : draft.characterMode === "product-only"
+                ? "本镜头不新增人物、手或人物道具。"
+                : "人物身份未被严格锁定；不要声称人物脸型已获得保证。",
+        inputsRoleInstruction(draft),
+        `镜头任务：${scene.purpose}`,
+        `分镜首帧设计：${scene.framePrompt}`,
+        `画幅：${draft.ratio}。商品主体完整，关键包装文字不被遮挡。若有人物/手与商品互动，接触点清晰、前后关系真实，不能穿模。`,
+        "静态画面不要字幕、水印、贴纸、第二个商品、额外logo、虚构包装背面或不可见内部结构；文字只保留参考图中实际可见内容。",
+    ].join("\n");
+}
+
+function inputsRoleInstruction(draft: Draft) {
+    if (draft.characterMode === "product-only") return "连接顺序：第 1 张是商品图；第 2、3 张即使存在也只可作为风格参考，不能改变商品身份。";
+    return "连接顺序：第 1 张是商品图，第 2 张是人物参考图，第 3 张可选为风格参考；不得把风格参考误当成商品或人物身份。";
+}
+
+function buildSceneVideoPrompt(scene: StoryboardScene, draft: Draft, hasCharacterReference: boolean) {
+    return [
+        "从这张已经确认的分镜静帧开始做 Grok image-to-video。静帧负责构图、光线、商品包装和人物外观；下面只描述发生什么变化，不要重新设计画面。",
+        `前 0.6 秒保持首帧稳定；随后只执行一个主动作：${scene.videoPrompt}`,
+        draft.characterMode === "strict-person" && hasCharacterReference ? "人物脸型、五官比例、发型和身份在整个镜头中保持一致。" : "不新增未被确认的人物、手或道具。",
+        "商品主体、包装、logo、可见文字、比例和轮廓保持不变；手与商品接触时遵守真实遮挡和深度关系，不穿过、不融合、不漂浮。",
+        `声音：${draft.sound || DEFAULT_SOUND}`,
+        `本镜头动态负面约束：${scene.negativePrompt}`,
+        "动作在前半段完成，后半段稳定收尾；不跳切、不突然变焦、不引入第二个动作。",
+    ].join("\n");
+}
+
+function renderStoryboardMarkdown(plan: StoryboardPlan, sourceLabel: string, hasCharacterReference: boolean) {
+    return [
+        "# Grok 商品广告脚本与分镜",
+        "",
+        `- 标题：${plan.title}`,
+        `- 商品首帧：${sourceLabel || "未连接"}`,
+        `- 人物参考：${hasCharacterReference ? "已连接第二张上游人物图" : "未连接"}`,
+        `- 整体目标：${plan.summary}`,
+        `- 商品锁定：${plan.productLock}`,
+        `- 人物锁定：${plan.characterLock}`,
+        `- 连续性：${plan.continuity}`,
+        "",
+        ...plan.scenes.flatMap((scene, index) => [
+            `## 镜头 ${index + 1}｜${scene.title}`,
+            `- 时长：${scene.duration} 秒`,
+            `- 任务：${scene.purpose}`,
+            `- 分镜首帧提示词：${scene.framePrompt}`,
+            `- Grok 动作提示词：${scene.videoPrompt}`,
+            `- 动态负面提示词：${scene.negativePrompt}`,
+            "",
+        ]),
+        "## 生成顺序",
+        "1. 先生成并确认每个镜头的静态分镜图。",
+        "2. 每张分镜图分别作为 Grok image-to-video 的唯一首帧。",
+        "3. 视频生成后逐镜头检查商品身份、人物脸型、手与商品接触、遮挡和包装文字。",
+    ].join("\n");
 }
 
 function buildNegativePrompt(draft: Draft) {
@@ -322,20 +598,45 @@ async function copyText(text: string) {
     }
 }
 
+function buildQualityChecklist(plan: StoryboardPlan | null) {
+    const sceneLines = plan?.scenes.map((scene, index) => `${index + 1}. 镜头 ${index + 1}「${scene.title}」：商品身份/包装文字、人物脸型、手与商品接触、遮挡关系、边缘闪烁、动作连续性。`) || [];
+    return [
+        "# Grok 商品图生视频质检清单",
+        "",
+        "以下项目不能靠提示词做到绝对保证，必须逐镜头观看，发现问题就只重生成对应镜头：",
+        "",
+        ...sceneLines,
+        "",
+        "## 判定标准",
+        "- 商品：包装形状、比例、颜色、logo、可见文字和配件没有改款、乱码、重复或漂移。",
+        "- 人物：同一人物的脸型、五官比例、发型和肤色稳定；没有突然换脸或年龄变化。",
+        "- 物理：手指没有畸形，手与商品接触点真实，人物/手/商品没有相互穿过、融合或漂浮。",
+        "- 连续性：镜头没有突然跳切、透视突变、曝光闪烁、纹理爬动和边缘抖动。",
+        "- 画面：没有字幕、水印、虚构logo、第二个商品或未展示的背面/内部结构。",
+        "",
+        "失败处理：保留通过的分镜图，只重生成失败镜头；如果商品包装或脸型仍然不稳定，应改用真实商品图/人物合成或具备 IP-Adapter、FaceID、ControlNet 的图像工作流，再把合格静帧交给 Grok 做动画。",
+    ].join("\n");
+}
+
 function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
-    const [busy, setBusy] = useState<"template" | "text" | "video" | null>(null);
+    const [busy, setBusy] = useState<"template" | "text" | "storyboard" | "video" | "videos" | null>(null);
     const draft = readDraft(ctx);
-    const sourceImage = findFirstImage(ctx);
-    const sourceLabel = sourceImage?.title || "商品首帧";
+    const inputImages = findInputImages(ctx);
+    const sourceImage = inputImages[0]?.node || null;
+    const sourceLabel = inputImages[0]?.title || "商品首帧";
+    const hasCharacterReference = Boolean(inputImages[1]?.content);
     const output = metadataText(ctx.node.metadata, "content");
+    const storyboardMarkdown = metadataText(ctx.node.metadata, "storyboardMarkdown");
     const positivePrompt = metadataText(ctx.node.metadata, "positivePrompt");
     const error = metadataText(ctx.node.metadata, "errorDetails");
+    const storyboardNotice = metadataText(ctx.node.metadata, "storyboardNotice");
     const copyStatus = metadataText(ctx.node.metadata, "copyStatus");
     const textModels = useMemo(() => ctx.ai.listModels("text"), [ctx.ai]);
+    const imageModels = useMemo(() => ctx.ai.listModels("image"), [ctx.ai]);
     const videoModels = useMemo(() => ctx.ai.listModels("video"), [ctx.ai]);
 
-    const promptFields = new Set(["brief", "productFacts", "mustKeep", "allowedChange", "forbidden", "sound", "duration", "ratio", "lockMode"]);
-    const setField = (key: string, value: string) => ctx.updateMetadata({ [key]: value, ...(promptFields.has(key) ? { content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "" } : {}) });
+    const promptFields = new Set(["brief", "productFacts", "mustKeep", "allowedChange", "forbidden", "sound", "duration", "ratio", "lockMode", "sceneCount", "characterMode", "imageModel"]);
+    const setField = (key: string, value: string) => ctx.updateMetadata({ [key]: value, ...(promptFields.has(key) ? { content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "", storyboardPlan: "", storyboardMarkdown: "", storyboardFingerprint: "", storyboardNotice: "" } : {}) });
     const stopCanvas = (event: { stopPropagation: () => void }) => event.stopPropagation();
     const fallback = () => buildPromptResult(draft, sourceLabel, Boolean(sourceImage));
     const currentPromptResult = () => {
@@ -346,9 +647,12 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
         return fallback();
     };
     const currentPromptContent = () => {
+        const storedStoryboardFingerprint = metadataText(ctx.node.metadata, "storyboardFingerprint");
+        if (storyboardMarkdown && storedStoryboardFingerprint && storedStoryboardFingerprint === storyboardFingerprint(draft)) return storyboardMarkdown;
         const storedFingerprint = metadataText(ctx.node.metadata, "promptFingerprint");
         return output && storedFingerprint && storedFingerprint === promptFingerprint(draft) ? output : fallback().content;
     };
+    const storedStoryboard = parseStoredStoryboard(ctx.node.metadata?.storyboardPlan);
 
     const saveTemplate = () => {
         const result = fallback();
@@ -365,6 +669,96 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
             ctx.updateMetadata({ content: result.content, positivePrompt: result.positivePrompt, negativePrompt: result.negativePrompt, promptFingerprint: promptFingerprint(draft), status: "success", errorDetails: "" });
         } catch (error) {
             ctx.updateMetadata({ status: "error", errorDetails: errorMessage(error) });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const createStoryboard = async () => {
+        if (!sourceImage) {
+            ctx.updateMetadata({ status: "error", errorDetails: "请先把商品图片节点连接到本节点。" });
+            return;
+        }
+        if (draft.characterMode === "strict-person" && !hasCharacterReference) {
+            ctx.updateMetadata({ status: "error", errorDetails: "人物锁定模式需要第二张上游图片作为人物参考图。请按顺序连接：商品图 → 人物图 →（可选）风格图。" });
+            return;
+        }
+        const fallbackPlan = buildStoryboardFallback(draft, hasCharacterReference);
+        const references = storyboardReferences(inputImages, draft);
+        let plan = fallbackPlan;
+        let planningNotice = "";
+        setBusy("storyboard");
+        ctx.updateMetadata({ status: "loading", errorDetails: "", storyboardNotice: "" });
+        try {
+            if (textModels.length) {
+                try {
+                    const response = await ctx.ai.generateText(buildStoryboardAiPrompt(draft, fallbackPlan, hasCharacterReference), {
+                        system: STORYBOARD_SYSTEM,
+                        model: draft.textModel || undefined,
+                    });
+                    const parsedPlan = parseStoryboardResponse(response.text, fallbackPlan);
+                    plan = { ...parsedPlan, scenes: parsedPlan.scenes.slice(0, Number(draft.sceneCount)) };
+                } catch (error) {
+                    planningNotice = `AI 分镜规划不可用，已使用保守模板继续生成：${errorMessage(error)}`;
+                }
+            } else {
+                planningNotice = "未配置文本模型，已使用保守模板生成分镜。";
+            }
+
+            for (let index = 0; index < plan.scenes.length; index += 1) {
+                const scene = plan.scenes[index];
+                const generated = await ctx.ai.generateImage(buildSceneFramePrompt(scene, draft, hasCharacterReference), {
+                    references,
+                    size: generationSize(draft.ratio),
+                    count: 1,
+                    model: draft.imageModel || undefined,
+                });
+                const imageContent = generated.images[0];
+                if (!imageContent) throw new Error(`镜头 ${index + 1} 没有返回分镜图。`);
+                const imageNodeId = `${PLUGIN_ID}-storyboard-${ctx.node.id}-${scene.id}-${Date.now()}`;
+                const frameSize = draft.ratio === "9:16 竖版" ? { width: 260, height: 462 } : draft.ratio === "1:1 方形" ? { width: 360, height: 360 } : { width: 420, height: 236 };
+                const gridColumn = index % 3;
+                const gridRow = Math.floor(index / 3);
+                plan.scenes[index] = { ...scene, imageNodeId };
+                ctx.applyOps([
+                    {
+                        type: "add_node",
+                        id: imageNodeId,
+                        nodeType: "image",
+                        title: `分镜 ${index + 1}｜${scene.title}`,
+                        x: ctx.node.position.x + ctx.node.width + 80 + gridColumn * (frameSize.width + 60),
+                        y: ctx.node.position.y + gridRow * (frameSize.height + 100),
+                        width: frameSize.width,
+                        height: frameSize.height,
+                        metadata: {
+                            content: imageContent,
+                            status: "success",
+                            mimeType: imageContent.match(/^data:([^;]+);/)?.[1] || "image/png",
+                            generationMode: "image",
+                            generationType: "edit",
+                            prompt: buildSceneFramePrompt(scene, draft, hasCharacterReference),
+                            storyboardOwnerId: ctx.node.id,
+                            storyboardSceneId: scene.id,
+                            storyboardSceneIndex: index,
+                            storyboardFingerprint: storyboardFingerprint(draft),
+                        },
+                    },
+                    { type: "connect_nodes", fromNodeId: ctx.node.id, toNodeId: imageNodeId },
+                ]);
+                ctx.updateMetadata({ storyboardPlan: JSON.stringify(plan) });
+            }
+            const markdown = renderStoryboardMarkdown(plan, sourceLabel, hasCharacterReference);
+            ctx.updateMetadata({
+                content: markdown,
+                storyboardMarkdown: markdown,
+                storyboardPlan: JSON.stringify(plan),
+                storyboardFingerprint: storyboardFingerprint(draft),
+                status: "success",
+                errorDetails: "",
+                storyboardNotice: planningNotice,
+            });
+        } catch (error) {
+            ctx.updateMetadata({ status: "error", errorDetails: `分镜生成失败：${errorMessage(error)}`, storyboardPlan: JSON.stringify(plan), storyboardFingerprint: storyboardFingerprint(draft), storyboardNotice: planningNotice });
         } finally {
             setBusy(null);
         }
@@ -429,6 +823,101 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
         }
     };
 
+    const generateStoryboardVideos = async () => {
+        const plan = parseStoredStoryboard(ctx.node.metadata?.storyboardPlan);
+        if (!plan) {
+            ctx.updateMetadata({ status: "error", errorDetails: "请先点击“一键生成脚本与分镜图”，并确认分镜图已经生成。" });
+            return;
+        }
+        const imageNodes = ctx.getNodes().filter((node) => asString(node.metadata?.storyboardOwnerId) === ctx.node.id && Boolean(asString(node.metadata?.content)) && asString(node.metadata?.storyboardSceneId));
+        const imageByScene = new Map(imageNodes.map((node) => [asString(node.metadata?.storyboardSceneId), node]));
+        const missing = plan.scenes.filter((scene) => !imageByScene.get(scene.id));
+        if (missing.length) {
+            ctx.updateMetadata({ status: "error", errorDetails: `缺少 ${missing.length} 张分镜首帧，请重新生成分镜图。` });
+            return;
+        }
+        setBusy("videos");
+        ctx.updateMetadata({ status: "loading", errorDetails: "", videoBatchStatus: "生成中" });
+        let completed = 0;
+        const failures: string[] = [];
+        try {
+            for (let index = 0; index < plan.scenes.length; index += 1) {
+                const scene = plan.scenes[index];
+                const imageNode = imageByScene.get(scene.id);
+                if (!imageNode) continue;
+                try {
+                    const video = await ctx.ai.generateVideo(buildSceneVideoPrompt(scene, draft, hasCharacterReference), {
+                        references: [asString(imageNode.metadata?.content)],
+                        seconds: normalizeSceneDuration(scene.duration, draft.duration),
+                        size: generationSize(draft.ratio),
+                        model: draft.videoModel || undefined,
+                    });
+                    const videoNodeId = `${PLUGIN_ID}-storyboard-video-${ctx.node.id}-${scene.id}-${Date.now()}`;
+                    const frameWidth = imageNode.width || 420;
+                    const videoSize = videoNodeSize(draft.ratio);
+                    ctx.applyOps([
+                        {
+                            type: "add_node",
+                            id: videoNodeId,
+                            nodeType: "video",
+                            title: `Grok 视频 ${index + 1}｜${scene.title}`,
+                            x: imageNode.position.x + frameWidth + 60,
+                            y: imageNode.position.y,
+                            width: videoSize.width,
+                            height: videoSize.height,
+                            metadata: {
+                                content: video.url,
+                                status: "success",
+                                mimeType: video.mimeType,
+                                naturalWidth: video.width,
+                                naturalHeight: video.height,
+                                durationMs: video.durationMs,
+                                storyboardOwnerId: ctx.node.id,
+                                storyboardSceneId: scene.id,
+                                storyboardSceneIndex: index,
+                                storyboardImageNodeId: imageNode.id,
+                                generationMode: "video",
+                                prompt: buildSceneVideoPrompt(scene, draft, hasCharacterReference),
+                            },
+                        },
+                        { type: "connect_nodes", fromNodeId: imageNode.id, toNodeId: videoNodeId },
+                    ]);
+                    completed += 1;
+                    ctx.updateMetadata({ videoBatchStatus: `已完成 ${completed}/${plan.scenes.length}` });
+                } catch (error) {
+                    failures.push(`镜头 ${index + 1}「${scene.title}」：${errorMessage(error)}`);
+                }
+            }
+            const statusText = `已完成 ${completed}/${plan.scenes.length}`;
+            ctx.updateMetadata({
+                status: failures.length ? "error" : "success",
+                videoBatchStatus: statusText,
+                errorDetails: failures.length ? `${statusText}；失败项：${failures.join("；")}` : "",
+            });
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const createQualityChecklist = () => {
+        const plan = parseStoredStoryboard(ctx.node.metadata?.storyboardPlan);
+        const id = `${PLUGIN_ID}-qa-${Date.now()}`;
+        ctx.applyOps([
+            {
+                type: "add_node",
+                id,
+                nodeType: "text",
+                title: "Grok 视频质检清单",
+                x: ctx.node.position.x + ctx.node.width + 80,
+                y: ctx.node.position.y + 760,
+                width: 620,
+                height: 420,
+                metadata: { content: buildQualityChecklist(plan), status: "success", fontSize: 14 },
+            },
+            { type: "connect_nodes", fromNodeId: ctx.node.id, toNodeId: id },
+        ]);
+    };
+
     const copy = async (value: string) => {
         const ok = await copyText(value);
         ctx.updateMetadata({ copyStatus: ok ? "已复制" : "复制失败，请手动选择文本复制" });
@@ -449,14 +938,24 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                 <span style={{ fontSize: 11, color: sourceImage ? "#16a34a" : "#d97706" }}>{sourceImage ? "首帧已接入" : "等待商品图"}</span>
             </div>
 
-            {sourceImage ? (
-                <div style={{ display: "flex", gap: 8, alignItems: "center", padding: 6, borderRadius: 8, background: ctx.theme.toolbar.panel }}>
-                    <img src={asString(sourceImage.metadata?.content)} alt={sourceLabel} style={{ width: 52, height: 42, borderRadius: 5, objectFit: "contain", background: "#fff" }} />
-                    <div style={{ minWidth: 0, fontSize: 11, color: ctx.theme.node.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>参考首帧：{sourceLabel}</div>
+            {inputImages.length ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 5, padding: 6, borderRadius: 8, background: ctx.theme.toolbar.panel }}>
+                    {inputImages.slice(0, 3).map((input, index) => (
+                        <div key={input.node.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                            <img src={input.content} alt={input.title} style={{ width: 42, height: 34, borderRadius: 5, objectFit: "contain", background: "#fff" }} />
+                            <div style={{ minWidth: 0, fontSize: 11, color: ctx.theme.node.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {index === 0 ? "商品图" : index === 1 ? "人物参考" : "风格参考"}：{input.title}
+                            </div>
+                        </div>
+                    ))}
                 </div>
             ) : (
-                <div style={{ padding: 8, borderRadius: 8, background: "#f59e0b14", color: ctx.theme.node.muted, fontSize: 11, lineHeight: 1.45 }}>把画布里的商品图片节点连接到本节点。脚本模板仍可先生成，但直接生成视频需要首帧。</div>
+                <div style={{ padding: 8, borderRadius: 8, background: "#f59e0b14", color: ctx.theme.node.muted, fontSize: 11, lineHeight: 1.45 }}>把画布里的商品图片节点连接到本节点。脚本可以先生成，但生成分镜图和视频都需要商品图。</div>
             )}
+
+            <div style={{ padding: 7, borderRadius: 8, background: "#2563eb12", color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.45 }}>
+                参考图连接顺序：第 1 张商品图；第 2 张人物图（要锁脸型时必接）；第 3 张可选风格图。人物和风格图不能替代商品图。
+            </div>
 
             <div>
                 <label style={labelStyle}>视频目标 / 主动作</label>
@@ -474,6 +973,20 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                     <label style={labelStyle}>画幅</label>
                     <select value={draft.ratio} onChange={(event) => setField("ratio", event.target.value)} onMouseDown={stopCanvas} style={inputStyle}>
                         {["保持首帧画幅", "9:16 竖版", "16:9 横版", "1:1 方形"].map((value) => <option key={value} value={value}>{value}</option>)}
+                    </select>
+                </div>
+                <div>
+                    <label style={labelStyle}>分镜数</label>
+                    <select value={draft.sceneCount} onChange={(event) => setField("sceneCount", event.target.value)} onMouseDown={stopCanvas} style={inputStyle}>
+                        {["2", "3", "4"].map((value) => <option key={value} value={value}>{value} 个镜头</option>)}
+                    </select>
+                </div>
+                <div>
+                    <label style={labelStyle}>人物一致性</label>
+                    <select value={draft.characterMode} onChange={(event) => setField("characterMode", event.target.value)} onMouseDown={stopCanvas} style={inputStyle}>
+                        <option value="product-only">商品展示：不加人物</option>
+                        <option value="strict-person">人物锁定：必须连接第二张人物图</option>
+                        <option value="free-person">人物自由生成：不保证脸型</option>
                     </select>
                 </div>
             </div>
@@ -497,15 +1010,22 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 <button type="button" onMouseDown={stopCanvas} onClick={saveTemplate} style={primaryButtonStyle} disabled={busy !== null}>生成模板脚本</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={() => void polishWithAi()} style={buttonStyle} disabled={busy !== null}>{busy === "text" ? "AI润色中…" : "AI润色"}</button>
+                <button type="button" onMouseDown={stopCanvas} onClick={() => void createStoryboard()} style={primaryButtonStyle} disabled={busy !== null || !sourceImage}>{busy === "storyboard" ? "脚本与分镜生成中…" : "一键生成脚本与分镜图"}</button>
+                <button type="button" onMouseDown={stopCanvas} onClick={() => void generateStoryboardVideos()} style={buttonStyle} disabled={busy !== null || !storedStoryboard}>{busy === "videos" ? "逐镜头生成视频中…" : "一键生成视频（全部分镜）"}</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={createTextOutput} style={buttonStyle} disabled={busy !== null}>输出正向提示词</button>
+                <button type="button" onMouseDown={stopCanvas} onClick={createQualityChecklist} style={buttonStyle} disabled={busy !== null}>输出质检清单</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={copyNativeXaiScript} style={buttonStyle} disabled={busy !== null}>复制原生 xAI 脚本</button>
-                <button type="button" onMouseDown={stopCanvas} onClick={() => void generateVideo()} style={buttonStyle} disabled={busy !== null || !sourceImage}>{busy === "video" ? "生成视频中…" : "生成视频（当前模型）"}</button>
+                <button type="button" onMouseDown={stopCanvas} onClick={() => void generateVideo()} style={buttonStyle} disabled={busy !== null || !sourceImage}>{busy === "video" ? "单镜头生成中…" : "生成单镜头视频（原商品首帧）"}</button>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
                 <select value={draft.textModel} onChange={(event) => setField("textModel", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} aria-label="文本模型">
                     <option value="">文本模型：当前默认</option>
                     {textModels.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}
+                </select>
+                <select value={draft.imageModel} onChange={(event) => setField("imageModel", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} aria-label="分镜图模型">
+                    <option value="">分镜图模型：当前默认</option>
+                    {imageModels.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}
                 </select>
                 <select value={draft.videoModel} onChange={(event) => setField("videoModel", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} aria-label="视频模型">
                     <option value="">视频模型：当前默认</option>
@@ -514,11 +1034,12 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
             </div>
 
             {error ? <div style={{ color: "#dc2626", fontSize: 11, lineHeight: 1.4 }}>{error}</div> : null}
+            {storyboardNotice ? <div style={{ color: "#b45309", fontSize: 11, lineHeight: 1.4 }}>{storyboardNotice}</div> : null}
             {copyStatus ? <div style={{ color: "#16a34a", fontSize: 11 }}>{copyStatus}</div> : null}
 
             <div style={{ minHeight: 0, flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                    <span style={{ color: ctx.theme.node.muted, fontSize: 11 }}>脚本预览（输出资源为正向提示词）</span>
+                    <span style={{ color: ctx.theme.node.muted, fontSize: 11 }}>脚本 / 分镜预览</span>
                     <div style={{ display: "flex", gap: 5 }}>
                         <button type="button" onMouseDown={stopCanvas} onClick={() => void copy(currentPromptResult().positivePrompt)} style={{ ...buttonStyle, padding: "3px 7px", fontSize: 11 }}>复制正向</button>
                         <button type="button" onMouseDown={stopCanvas} onClick={() => void copy(currentPromptContent())} style={{ ...buttonStyle, padding: "3px 7px", fontSize: 11 }}>复制完整</button>
@@ -530,24 +1051,24 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
     );
 }
 
-export { buildPromptResult, buildNegativePrompt, normalizeDuration, promptFingerprint, XAI_NATIVE_VIDEO_SCRIPT };
+export { buildPromptResult, buildNegativePrompt, normalizeDuration, normalizeSceneCount, promptFingerprint, storyboardFingerprint, buildStoryboardFallback, buildStoryboardAiPrompt, parseStoryboardResponse, buildSceneVideoPrompt, XAI_NATIVE_VIDEO_SCRIPT };
 
 export default definePlugin({
     id: PLUGIN_ID,
     name: "Grok 商品图生视频",
-    version: "0.2.0",
-    description: "把商品首帧、动作目标和商品锁定规则整理成严格首帧 Grok 图生视频脚本，并提供原生 xAI 模型脚本。",
+    version: "0.3.0",
+    description: "把商品图和效果描述拆成脚本、分镜首帧与 Grok 逐镜头图生视频，并提供商品/人物一致性约束与质检清单。",
     nodes: [
         {
             type: `${PLUGIN_ID}:prompt`,
             title: "Grok 商品图生视频",
             icon: "🎬",
-            description: "商品首帧 → 商品锁定 → 动作时间轴 → Grok 正负提示词",
-            defaultSize: { width: 520, height: 720 },
-            defaultMetadata: { brief: "", productFacts: "", mustKeep: "", allowedChange: "", forbidden: "", sound: DEFAULT_SOUND, duration: DEFAULT_DURATION, ratio: DEFAULT_RATIO, lockMode: DEFAULT_LOCK_MODE, content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "", status: "idle" },
+            description: "商品图 → 脚本与分镜首帧 → Grok 逐镜头视频 → 质检",
+            defaultSize: { width: 520, height: 820 },
+            defaultMetadata: { brief: "", productFacts: "", mustKeep: "", allowedChange: "", forbidden: "", sound: DEFAULT_SOUND, duration: DEFAULT_DURATION, ratio: DEFAULT_RATIO, lockMode: DEFAULT_LOCK_MODE, textModel: "", imageModel: "", videoModel: "", sceneCount: DEFAULT_SCENE_COUNT, characterMode: DEFAULT_CHARACTER_MODE, content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "", storyboardPlan: "", storyboardMarkdown: "", storyboardFingerprint: "", status: "idle" },
             minimapColor: "#7c3aed",
             hidePanel: true,
-            resource: (node) => ({ kind: "text", text: asString(node.metadata?.positivePrompt) || asString(node.metadata?.content) }),
+            resource: (node) => ({ kind: "text", text: asString(node.metadata?.storyboardMarkdown) || asString(node.metadata?.positivePrompt) || asString(node.metadata?.content) }),
             Content: GrokProductI2VContent,
         },
     ],
