@@ -32,11 +32,15 @@ var jsxs = jsx;
 
 // src/index.tsx
 var PLUGIN_ID = "grok-product-i2v";
-var DEFAULT_DURATION = "6";
-var DEFAULT_RATIO = "\u4FDD\u6301\u9996\u5E27\u753B\u5E45";
+var DEFAULT_DURATION = "15";
+var MAX_TOTAL_DURATION = 60;
+var MAX_SCENE_SECONDS = 15;
+var MIN_SCENE_SECONDS = 2;
+var DEFAULT_RATIO = "9:16 \u7AD6\u7248";
 var DEFAULT_LOCK_MODE = "strict";
 var DEFAULT_SOUND = "\u8F7B\u5FAE\u771F\u5B9E\u73AF\u5883\u58F0\u6216\u6750\u8D28\u6469\u64E6\u58F0\uFF1B\u4E0D\u8981\u65C1\u767D\u3001\u4E0D\u8981\u53F0\u8BCD\u3001\u4E0D\u8981\u97F3\u4E50\u62A2\u4E3B\u4F53\u3002";
 var DEFAULT_SCENE_COUNT = "3";
+var MAX_SCENE_COUNT = 20;
 var DEFAULT_CHARACTER_MODE = "product-only";
 var XAI_NATIVE_VIDEO_SCRIPT = `// \u539F\u751F xAI Grok Image-to-Video\uFF1A\u5FC5\u987B\u628A\u9996\u5E27\u653E\u8FDB image \u5B57\u6BB5
 const source = images[0];
@@ -102,6 +106,15 @@ const headers = { "Content-Type": "application/json", Authorization: "Bearer " +
 const sizeMatch = typeof params.size === "string" ? params.size.match(/^(\\d+)x(\\d+)$/) : null;
 const width = sizeMatch ? Number(sizeMatch[1]) : undefined;
 const height = sizeMatch ? Number(sizeMatch[2]) : undefined;
+const size = typeof params.size === "string" ? params.size : undefined;
+const aspectRatio = size === "720x1280"
+  ? "9:16"
+  : size === "1280x720"
+    ? "16:9"
+    : size === "1024x1024"
+      ? "1:1"
+      : (typeof params.ratio === "string" && params.ratio.includes(":") ? params.ratio : undefined);
+const resolution = typeof params.resolution === "string" ? params.resolution : undefined;
 
 const task = await request({
   method: "post",
@@ -114,6 +127,14 @@ const task = await request({
     duration: Number(params.seconds),
     ...(Number.isFinite(width) ? { width } : {}),
     ...(Number.isFinite(height) ? { height } : {}),
+    ...(size ? { size } : {}),
+    ...(aspectRatio ? { aspect_ratio: aspectRatio, aspectRatio, ratio: aspectRatio } : {}),
+    ...(resolution ? { resolution } : {}),
+    metadata: {
+      ...(size ? { size } : {}),
+      ...(aspectRatio ? { aspect_ratio: aspectRatio, aspectRatio, ratio: aspectRatio } : {}),
+      ...(resolution ? { resolution } : {}),
+    },
   },
 });
 
@@ -230,17 +251,31 @@ function findInputImages(ctx) {
 function normalizeDuration(value) {
   const parsed = Number.parseFloat(value);
   if (!Number.isFinite(parsed)) return DEFAULT_DURATION;
-  return String(Math.min(15, Math.max(2, Math.round(parsed))));
+  return String(Math.min(MAX_TOTAL_DURATION, Math.max(MIN_SCENE_SECONDS, Math.round(parsed))));
 }
 function normalizeSceneCount(value) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) return DEFAULT_SCENE_COUNT;
-  return String(Math.min(4, Math.max(2, parsed)));
+  return String(Math.min(MAX_SCENE_COUNT, Math.max(1, parsed)));
 }
 function normalizeSceneDuration(value, fallback = "4") {
   const parsed = Number.parseFloat(value);
   if (!Number.isFinite(parsed)) return fallback;
-  return String(Math.min(10, Math.max(2, Math.round(parsed))));
+  return String(Math.min(MAX_SCENE_SECONDS, Math.max(MIN_SCENE_SECONDS, Math.round(parsed))));
+}
+function effectiveSceneCount(totalDuration, requestedCount) {
+  const total = Number(normalizeDuration(totalDuration));
+  const requested = Number(normalizeSceneCount(requestedCount));
+  const minimumCount = Math.ceil(total / MAX_SCENE_SECONDS);
+  const maximumCount = Math.max(1, Math.floor(total / MIN_SCENE_SECONDS));
+  return Math.min(MAX_SCENE_COUNT, Math.max(minimumCount, Math.min(requested, maximumCount)));
+}
+function distributeSceneDurations(totalDuration, count) {
+  const total = Number(normalizeDuration(totalDuration));
+  const safeCount = Math.max(1, Math.min(count, Math.floor(total / MIN_SCENE_SECONDS)));
+  const base = Math.floor(total / safeCount);
+  const remainder = total % safeCount;
+  return Array.from({ length: safeCount }, (_, index) => String(base + (index < remainder ? 1 : 0)));
 }
 function ratioInstruction(ratio) {
   if (ratio === "9:16 \u7AD6\u7248") return "\u8F93\u51FA 9:16 \u7AD6\u7248\u6784\u56FE\uFF0C\u4E3B\u4F53\u5B8C\u6574\u4E0D\u88C1\u5207\uFF0C\u5546\u54C1\u5E95\u90E8\u7559\u5B89\u5168\u8FB9\u8DDD\u3002";
@@ -258,6 +293,177 @@ function videoNodeSize(ratio) {
   if (ratio === "9:16 \u7AD6\u7248") return { width: 360, height: 640 };
   if (ratio === "1:1 \u65B9\u5F62") return { width: 420, height: 420 };
   return { width: 420, height: 236 };
+}
+function compositionDimensions(ratio) {
+  if (ratio === "9:16 \u7AD6\u7248") return { width: 720, height: 1280 };
+  if (ratio === "1:1 \u65B9\u5F62") return { width: 1024, height: 1024 };
+  return { width: 1280, height: 720 };
+}
+function waitForVideoReady(video) {
+  if (video.readyState >= 2) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      video.removeEventListener("loadeddata", onReady);
+      video.removeEventListener("error", onError);
+    };
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("\u6D4F\u89C8\u5668\u65E0\u6CD5\u8BFB\u53D6\u89C6\u9891\u6E90\uFF0C\u53EF\u80FD\u662F\u6E20\u9053\u89C6\u9891\u5730\u5740\u4E0D\u5141\u8BB8\u8DE8\u57DF\u8BFB\u53D6\u3002"));
+    };
+    video.addEventListener("loadeddata", onReady, { once: true });
+    video.addEventListener("error", onError, { once: true });
+  });
+}
+function drawVideoCover(context, video, width, height) {
+  const sourceWidth = video.videoWidth || width;
+  const sourceHeight = video.videoHeight || height;
+  const sourceRatio = sourceWidth / sourceHeight;
+  const targetRatio = width / height;
+  let sx = 0;
+  let sy = 0;
+  let sw = sourceWidth;
+  let sh = sourceHeight;
+  if (sourceRatio > targetRatio) {
+    sw = sourceHeight * targetRatio;
+    sx = (sourceWidth - sw) / 2;
+  } else if (sourceRatio < targetRatio) {
+    sh = sourceWidth / targetRatio;
+    sy = (sourceHeight - sh) / 2;
+  }
+  context.fillStyle = "#000";
+  context.fillRect(0, 0, width, height);
+  context.drawImage(video, sx, sy, sw, sh, 0, 0, width, height);
+}
+function recordVideoFrames(video, context, width, height) {
+  return new Promise((resolve, reject) => {
+    let frameId = 0;
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      window.cancelAnimationFrame(frameId);
+      if (error) reject(error);
+      else resolve();
+    };
+    const draw = () => {
+      try {
+        drawVideoCover(context, video, width, height);
+      } catch {
+        finish(new Error("\u89C6\u9891\u8DE8\u57DF\u7B56\u7565\u963B\u6B62\u4E86\u81EA\u52A8\u5408\u6210\uFF0C\u8BF7\u4FDD\u7559\u4F7F\u7528\u4E0B\u65B9\u5206\u955C\u89C6\u9891\u3002"));
+        return;
+      }
+      if (video.ended) {
+        finish();
+        return;
+      }
+      frameId = window.requestAnimationFrame(draw);
+    };
+    video.addEventListener("ended", () => finish(), { once: true });
+    video.addEventListener("error", () => finish(new Error("\u89C6\u9891\u64AD\u653E\u5931\u8D25\uFF0C\u65E0\u6CD5\u5B8C\u6210\u81EA\u52A8\u5408\u6210\u3002")), { once: true });
+    draw();
+  });
+}
+async function composeVideoUrls(urls, ratio) {
+  if (!urls.length) throw new Error("\u6CA1\u6709\u53EF\u5408\u6210\u7684\u89C6\u9891\u7247\u6BB5\u3002");
+  if (typeof document === "undefined" || typeof MediaRecorder === "undefined" || typeof HTMLCanvasElement === "undefined" || !HTMLCanvasElement.prototype.captureStream) {
+    throw new Error("\u5F53\u524D\u6D4F\u89C8\u5668\u4E0D\u652F\u6301\u81EA\u52A8\u5408\u6210\uFF1B\u8BF7\u4F7F\u7528\u65B0\u7248 Chrome\uFF0C\u6216\u624B\u52A8\u4F7F\u7528\u4E0B\u65B9\u5206\u955C\u89C6\u9891\u3002");
+  }
+  const { width, height } = compositionDimensions(ratio);
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("\u6D4F\u89C8\u5668\u65E0\u6CD5\u521B\u5EFA\u89C6\u9891\u5408\u6210\u753B\u5E03\u3002");
+  const stream = canvas.captureStream(30);
+  const mimeTypes = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
+  const mimeType = mimeTypes.find((value) => MediaRecorder.isTypeSupported(value)) || "";
+  const recorder = mimeType ? new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8e6 }) : new MediaRecorder(stream);
+  const chunks = [];
+  const stopped = new Promise((resolve, reject) => {
+    recorder.onstop = () => resolve();
+    recorder.onerror = () => reject(new Error("\u6D4F\u89C8\u5668\u5F55\u5236\u5408\u6210\u89C6\u9891\u5931\u8D25\u3002"));
+  });
+  let audioContext = null;
+  let audioDestination = null;
+  if (typeof AudioContext !== "undefined") {
+    try {
+      audioContext = new AudioContext();
+      await audioContext.resume();
+      audioDestination = audioContext.createMediaStreamDestination();
+      const audioTrack = audioDestination.stream.getAudioTracks()[0];
+      if (audioTrack) stream.addTrack(audioTrack);
+    } catch {
+      audioContext = null;
+      audioDestination = null;
+    }
+  }
+  recorder.ondataavailable = (event) => {
+    if (event.data.size) chunks.push(event.data);
+  };
+  recorder.start(500);
+  const startedAt = performance.now();
+  try {
+    for (const url of urls) {
+      const video = document.createElement("video");
+      video.crossOrigin = "anonymous";
+      video.playsInline = true;
+      video.preload = "auto";
+      video.muted = false;
+      video.style.position = "fixed";
+      video.style.left = "-10000px";
+      video.style.top = "0";
+      video.style.width = "1px";
+      video.style.height = "1px";
+      video.style.opacity = "0";
+      video.style.pointerEvents = "none";
+      document.body.appendChild(video);
+      let audioSource = null;
+      try {
+        video.src = url;
+        video.load();
+        await waitForVideoReady(video);
+        if (audioContext && audioDestination) {
+          try {
+            audioSource = audioContext.createMediaElementSource(video);
+            audioSource.connect(audioDestination);
+          } catch {
+            audioSource = null;
+          }
+        }
+        try {
+          await video.play();
+        } catch {
+          video.muted = true;
+          await video.play();
+        }
+        await recordVideoFrames(video, context, width, height);
+      } finally {
+        audioSource?.disconnect();
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+        video.remove();
+      }
+    }
+  } finally {
+    if (recorder.state !== "inactive") recorder.stop();
+    stream.getTracks().forEach((track) => track.stop());
+    if (audioContext) await audioContext.close().catch(() => void 0);
+  }
+  await stopped;
+  const blob = new Blob(chunks, { type: mimeType || "video/webm" });
+  if (!blob.size) throw new Error("\u81EA\u52A8\u5408\u6210\u6CA1\u6709\u751F\u6210\u6709\u6548\u7684\u89C6\u9891\u6587\u4EF6\u3002");
+  return {
+    url: URL.createObjectURL(blob),
+    mimeType: blob.type || "video/webm",
+    width,
+    height,
+    durationMs: Math.round(performance.now() - startedAt)
+  };
 }
 function primaryAction(brief) {
   const normalized = brief.replace(/\s+/g, " ").trim();
@@ -290,14 +496,10 @@ function characterLockText(draft, hasCharacterReference) {
   return "\u5141\u8BB8\u51FA\u73B0\u4EBA\u7269\uFF0C\u4F46\u672A\u542F\u7528\u4EBA\u7269\u8EAB\u4EFD\u9501\u5B9A\uFF1B\u4E0D\u8981\u628A\u6B64\u6A21\u5F0F\u63CF\u8FF0\u4E3A\u8138\u578B\u4E00\u81F4\u4FDD\u8BC1\u3002";
 }
 function sceneDuration(totalDuration, index, count) {
-  const total = Number(totalDuration);
-  if (!Number.isFinite(total)) return "4";
-  const base = Math.max(2, Math.round(total / count));
-  if (index === count - 1) return normalizeSceneDuration(String(Math.max(2, total - base * (count - 1))), String(base));
-  return normalizeSceneDuration(String(base), "4");
+  return distributeSceneDurations(totalDuration, count)[index] || String(MIN_SCENE_SECONDS);
 }
 function buildStoryboardFallback(draft, hasCharacterReference) {
-  const count = Number(normalizeSceneCount(draft.sceneCount));
+  const count = effectiveSceneCount(draft.duration, draft.sceneCount);
   const action = primaryAction(draft.brief);
   const characterLock = characterLockText(draft, hasCharacterReference);
   const usesPerson = draft.characterMode !== "product-only" && hasCharacterReference;
@@ -339,7 +541,16 @@ function buildStoryboardFallback(draft, hasCharacterReference) {
       negativePrompt: "\u5C40\u90E8\u53D8\u6210\u65B0\u5546\u54C1\uFF0C\u5305\u88C5\u6587\u5B57\u4E71\u7801\uFF0C\u6750\u8D28\u6DB2\u5316\uFF0C\u7ED3\u6784\u7A7F\u6A21\uFF0C\u8FC7\u5EA6\u5FAE\u8DDD\uFF0C\u955C\u5934\u8DF3\u52A8\uFF0C\u7A81\u7136\u53D8\u7126"
     }
   ];
-  const selectedScenes = count === 2 ? [scenes[0], scenes[1]] : scenes.slice(0, count);
+  const durations = distributeSceneDurations(draft.duration, count);
+  const selectedScenes = Array.from({ length: count }, (_, index) => {
+    const base = scenes[index] || scenes[scenes.length - 1];
+    return {
+      ...base,
+      id: `s${index + 1}`,
+      title: index < scenes.length ? base.title : `${base.title} ${index + 1}`,
+      duration: durations[index] || base.duration
+    };
+  });
   return {
     title: "\u5546\u54C1\u56FE\u751F\u89C6\u9891\u5206\u955C",
     summary: draft.brief || "\u4EE5\u5546\u54C1\u4E3B\u4F53\u7A33\u5B9A\u5C55\u793A\u4E3A\u4E3B\uFF0C\u5148\u5EFA\u7ACB\u5546\u54C1\uFF0C\u518D\u5B8C\u6210\u4E00\u4E2A\u6838\u5FC3\u52A8\u4F5C\uFF0C\u6700\u540E\u7A33\u5B9A\u6536\u5C3E\u3002",
@@ -362,6 +573,7 @@ function buildStoryboardAiPrompt(draft, fallback, hasCharacterReference) {
     `\u4EBA\u7269\u9501\u5B9A\u89C4\u5219\uFF1A${characterLockText(draft, hasCharacterReference)}`,
     "\u8BF7\u9075\u5B88\uFF1A\u6BCF\u4E2A\u955C\u5934\u53EA\u505A\u4E00\u4E2A\u4E3B\u8981\u4EFB\u52A1\uFF1BframePrompt \u662F\u9759\u6001\u5206\u955C\u9996\u5E27\uFF0C\u5FC5\u987B\u5F3A\u8C03\u5546\u54C1/\u4EBA\u7269\u8EAB\u4EFD\u548C\u63A5\u89E6\u5173\u7CFB\uFF1BvideoPrompt \u53EA\u63CF\u8FF0\u4ECE\u8BE5\u9759\u5E27\u5F00\u59CB\u53D1\u751F\u7684\u52A8\u4F5C\u3001\u955C\u5934\u548C\u58F0\u97F3\uFF0C\u4E0D\u8981\u91CD\u65B0\u53D1\u660E\u6784\u56FE\u6216\u5546\u54C1\uFF1BnegativePrompt \u53EA\u5199\u672C\u955C\u5934\u6700\u53EF\u80FD\u51FA\u73B0\u7684\u9519\u8BEF\u3002",
     "\u4EE5\u4E0B\u662F\u4FDD\u5B88\u6A21\u677F\uFF0C\u82E5\u8F93\u5165\u4E8B\u5B9E\u4E0D\u8DB3\u8BF7\u6CBF\u7528\uFF0C\u4E0D\u8981\u8865\u5145\u672A\u5C55\u793A\u7684\u5546\u54C1\u7EC6\u8282\uFF1A",
+    `\u7CFB\u7EDF\u5B9E\u9645\u9700\u8981\u8F93\u51FA ${fallback.scenes.length} \u4E2A\u955C\u5934\uFF1B\u7528\u6237\u586B\u5199\u7684\u662F ${draft.sceneCount} \u4E2A\u3002\u6BCF\u955C\u5934\u6700\u591A\u6309 ${MAX_SCENE_SECONDS} \u79D2\u751F\u6210\uFF0C\u5FC5\u8981\u65F6\u4FDD\u6301\u603B\u65F6\u957F\u5E76\u81EA\u52A8\u5206\u6BB5\u3002`,
     JSON.stringify(fallback)
   ].join("\n");
 }
@@ -385,8 +597,8 @@ function parseStoryboardResponse(text, fallback) {
   try {
     const parsed = JSON.parse(trimmed.slice(start, end + 1));
     const rawScenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
-    if (rawScenes.length < 2) return fallback;
-    const scenes = rawScenes.slice(0, 4).map((scene, index) => normalizeStoryboardScene(scene, index, fallback.scenes[index] || fallback.scenes[fallback.scenes.length - 1]));
+    if (rawScenes.length < 1) return fallback;
+    const scenes = rawScenes.slice(0, MAX_SCENE_COUNT).map((scene, index) => normalizeStoryboardScene(scene, index, fallback.scenes[index] || fallback.scenes[fallback.scenes.length - 1]));
     return {
       title: asString(parsed.title, fallback.title) || fallback.title,
       summary: asString(parsed.summary, fallback.summary) || fallback.summary,
@@ -399,11 +611,27 @@ function parseStoryboardResponse(text, fallback) {
     return fallback;
   }
 }
+function normalizeStoryboardPlan(plan, draft, fallback) {
+  const count = effectiveSceneCount(draft.duration, draft.sceneCount);
+  const durations = distributeSceneDurations(draft.duration, count);
+  const sourceScenes = plan.scenes.length ? plan.scenes : fallback.scenes;
+  const scenes = Array.from({ length: count }, (_, index) => {
+    const source = sourceScenes[index] || sourceScenes[sourceScenes.length - 1] || fallback.scenes[fallback.scenes.length - 1];
+    const fallbackScene = fallback.scenes[index] || fallback.scenes[fallback.scenes.length - 1];
+    const normalized = normalizeStoryboardScene(source, index, fallbackScene);
+    return {
+      ...normalized,
+      id: `s${index + 1}`,
+      duration: durations[index] || fallbackScene.duration
+    };
+  });
+  return { ...plan, scenes };
+}
 function parseStoredStoryboard(value) {
   if (typeof value !== "string" || !value.trim()) return null;
   try {
     const parsed = JSON.parse(value);
-    if (!parsed || !Array.isArray(parsed.scenes) || parsed.scenes.length < 2) return null;
+    if (!parsed || !Array.isArray(parsed.scenes) || parsed.scenes.length < 1) return null;
     return parsed;
   } catch {
     return null;
@@ -438,6 +666,7 @@ function inputsRoleInstruction(draft) {
 function buildSceneVideoPrompt(scene, draft, hasCharacterReference) {
   return [
     "\u4ECE\u8FD9\u5F20\u5DF2\u7ECF\u786E\u8BA4\u7684\u5206\u955C\u9759\u5E27\u5F00\u59CB\u505A Grok image-to-video\u3002\u9759\u5E27\u8D1F\u8D23\u6784\u56FE\u3001\u5149\u7EBF\u3001\u5546\u54C1\u5305\u88C5\u548C\u4EBA\u7269\u5916\u89C2\uFF1B\u4E0B\u9762\u53EA\u63CF\u8FF0\u53D1\u751F\u4EC0\u4E48\u53D8\u5316\uFF0C\u4E0D\u8981\u91CD\u65B0\u8BBE\u8BA1\u753B\u9762\u3002",
+    `\u672C\u955C\u5934\u65F6\u957F\u7EA6 ${scene.duration} \u79D2\uFF1B\u603B\u6210\u7247\u65F6\u957F\u7531\u6240\u6709\u955C\u5934\u5408\u5E76\u540E\u8BA1\u7B97\u3002`,
     `\u524D 0.6 \u79D2\u4FDD\u6301\u9996\u5E27\u7A33\u5B9A\uFF1B\u968F\u540E\u53EA\u6267\u884C\u4E00\u4E2A\u4E3B\u52A8\u4F5C\uFF1A${scene.videoPrompt}`,
     draft.characterMode === "strict-person" && hasCharacterReference ? "\u4EBA\u7269\u8138\u578B\u3001\u4E94\u5B98\u6BD4\u4F8B\u3001\u53D1\u578B\u548C\u8EAB\u4EFD\u5728\u6574\u4E2A\u955C\u5934\u4E2D\u4FDD\u6301\u4E00\u81F4\u3002" : "\u4E0D\u65B0\u589E\u672A\u88AB\u786E\u8BA4\u7684\u4EBA\u7269\u3001\u624B\u6216\u9053\u5177\u3002",
     "\u5546\u54C1\u4E3B\u4F53\u3001\u5305\u88C5\u3001logo\u3001\u53EF\u89C1\u6587\u5B57\u3001\u6BD4\u4F8B\u548C\u8F6E\u5ED3\u4FDD\u6301\u4E0D\u53D8\uFF1B\u624B\u4E0E\u5546\u54C1\u63A5\u89E6\u65F6\u9075\u5B88\u771F\u5B9E\u906E\u6321\u548C\u6DF1\u5EA6\u5173\u7CFB\uFF0C\u4E0D\u7A7F\u8FC7\u3001\u4E0D\u878D\u5408\u3001\u4E0D\u6F02\u6D6E\u3002",
@@ -688,7 +917,7 @@ function GrokProductI2VContent({ ctx }) {
             model: draft.textModel || void 0
           });
           const parsedPlan = parseStoryboardResponse(response.text, fallbackPlan);
-          plan = { ...parsedPlan, scenes: parsedPlan.scenes.slice(0, Number(draft.sceneCount)) };
+          plan = normalizeStoryboardPlan(parsedPlan, draft, fallbackPlan);
         } catch (error2) {
           planningNotice = `AI \u5206\u955C\u89C4\u5212\u4E0D\u53EF\u7528\uFF0C\u5DF2\u4F7F\u7528\u4FDD\u5B88\u6A21\u677F\u7EE7\u7EED\u751F\u6210\uFF1A${errorMessage(error2)}`;
         }
@@ -783,12 +1012,14 @@ function GrokProductI2VContent({ ctx }) {
       const prompt = `${result.positivePrompt}
 
 \u52A8\u6001\u8D1F\u9762\u63D0\u793A\u8BCD\uFF1A${result.negativePrompt}`;
-      const video = await ctx.ai.generateVideo(prompt, {
+      const generatedVideo = await ctx.ai.generateVideo(prompt, {
         references: [asString(sourceImage.metadata?.content)],
-        seconds: draft.duration,
+        seconds: normalizeSceneDuration(draft.duration, String(MAX_SCENE_SECONDS)),
         size: generationSize(draft.ratio),
         model: draft.videoModel || void 0
       });
+      const composedVideo = await composeVideoUrls([generatedVideo.url], draft.ratio);
+      const video = { ...generatedVideo, ...composedVideo };
       const size = videoNodeSize(draft.ratio);
       const id = `${PLUGIN_ID}-video-${Date.now()}`;
       ctx.applyOps([
@@ -801,7 +1032,7 @@ function GrokProductI2VContent({ ctx }) {
           y: ctx.node.position.y + 30,
           width: size.width,
           height: size.height,
-          metadata: { content: video.url, status: "success", mimeType: video.mimeType, naturalWidth: video.width, naturalHeight: video.height, durationMs: video.durationMs }
+          metadata: { content: video.url, status: "success", mimeType: video.mimeType, naturalWidth: video.width, naturalHeight: video.height, durationMs: video.durationMs, generationMode: "video", compositionMode: "local-canvas", sourceVideoUrl: generatedVideo.url }
         },
         { type: "connect_nodes", fromNodeId: ctx.node.id, toNodeId: id }
       ]);
@@ -829,6 +1060,7 @@ function GrokProductI2VContent({ ctx }) {
     ctx.updateMetadata({ status: "loading", errorDetails: "", videoBatchStatus: "\u751F\u6210\u4E2D" });
     let completed = 0;
     const failures = [];
+    const clips = [];
     try {
       for (let index = 0; index < plan.scenes.length; index += 1) {
         const scene = plan.scenes[index];
@@ -871,10 +1103,60 @@ function GrokProductI2VContent({ ctx }) {
             },
             { type: "connect_nodes", fromNodeId: imageNode.id, toNodeId: videoNodeId }
           ]);
+          clips.push({
+            nodeId: videoNodeId,
+            url: video.url,
+            sceneId: scene.id,
+            sceneTitle: scene.title,
+            mimeType: video.mimeType,
+            width: video.width,
+            height: video.height,
+            durationMs: video.durationMs
+          });
           completed += 1;
           ctx.updateMetadata({ videoBatchStatus: `\u5DF2\u5B8C\u6210 ${completed}/${plan.scenes.length}` });
         } catch (error2) {
           failures.push(`\u955C\u5934 ${index + 1}\u300C${scene.title}\u300D\uFF1A${errorMessage(error2)}`);
+        }
+      }
+      let finalVideoNodeId = "";
+      if (!failures.length && clips.length) {
+        ctx.updateMetadata({ videoBatchStatus: `\u5DF2\u5B8C\u6210 ${completed}/${plan.scenes.length}\uFF0C\u6B63\u5728\u5408\u6210\u6700\u7EC8 ${draft.ratio} \u89C6\u9891\u2026`, videoCompositionStatus: "composing" });
+        try {
+          const composed = await composeVideoUrls(clips.map((clip) => clip.url), draft.ratio);
+          const finalSize = videoNodeSize(draft.ratio);
+          finalVideoNodeId = `${PLUGIN_ID}-storyboard-final-${ctx.node.id}-${Date.now()}`;
+          ctx.applyOps([
+            {
+              type: "add_node",
+              id: finalVideoNodeId,
+              nodeType: "video",
+              title: "Grok \u6700\u7EC8\u5408\u6210\u89C6\u9891\uFF08" + draft.duration + " \u79D2\uFF09",
+              x: ctx.node.position.x + ctx.node.width + 80 + finalSize.width + 80,
+              y: ctx.node.position.y + 760,
+              width: finalSize.width,
+              height: finalSize.height,
+              metadata: {
+                content: composed.url,
+                status: "success",
+                mimeType: composed.mimeType,
+                naturalWidth: composed.width,
+                naturalHeight: composed.height,
+                durationMs: composed.durationMs,
+                generationMode: "video",
+                compositionMode: "local-canvas",
+                compositionRatio: draft.ratio,
+                totalDurationSeconds: Number(draft.duration),
+                sourceVideoNodeIds: clips.map((clip) => clip.nodeId)
+              }
+            },
+            { type: "connect_nodes", fromNodeId: ctx.node.id, toNodeId: finalVideoNodeId },
+            ...clips.map((clip) => ({ type: "connect_nodes", fromNodeId: clip.nodeId, toNodeId: finalVideoNodeId }))
+          ]);
+          ctx.updateMetadata({ videoCompositionStatus: "success", finalVideoNodeId, videoCompositionMimeType: composed.mimeType });
+        } catch (error2) {
+          failures.push("\u81EA\u52A8\u5408\u6210\u6700\u7EC8\u89C6\u9891\uFF1A" + errorMessage(error2));
+          ctx.updateMetadata({ videoCompositionStatus: "error", videoCompositionError: errorMessage(error2) });
         }
       }
       const statusText = `\u5DF2\u5B8C\u6210 ${completed}/${plan.scenes.length}`;
@@ -883,6 +1165,7 @@ function GrokProductI2VContent({ ctx }) {
         videoBatchStatus: statusText,
         errorDetails: failures.length ? `${statusText}\uFF1B\u5931\u8D25\u9879\uFF1A${failures.join("\uFF1B")}` : ""
       });
+      if (finalVideoNodeId) ctx.updateMetadata({ videoBatchStatus: statusText + "\uFF0C\u5DF2\u5408\u6210\u6700\u7EC8\u89C6\u9891", finalVideoNodeId });
     } finally {
       setBusy(null);
     }
@@ -936,22 +1219,16 @@ function GrokProductI2VContent({ ctx }) {
     ] }),
     /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }, children: [
       /* @__PURE__ */ jsxs("div", { children: [
-        /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u65F6\u957F" }),
-        /* @__PURE__ */ jsx("select", { value: draft.duration, onChange: (event) => setField("duration", event.target.value), onMouseDown: stopCanvas, style: inputStyle, children: ["4", "5", "6", "8", "10", "12", "15"].map((value) => /* @__PURE__ */ jsxs("option", { value, children: [
-          value,
-          " \u79D2"
-        ] }, value)) })
+        /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u603B\u65F6\u957F\uFF082\u201360 \u79D2\uFF09" }),
+        /* @__PURE__ */ jsx("input", { type: "number", min: 2, max: 60, step: 1, value: draft.duration, onChange: (event) => setField("duration", event.target.value), onMouseDown: stopCanvas, style: inputStyle })
       ] }),
       /* @__PURE__ */ jsxs("div", { children: [
         /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u753B\u5E45" }),
         /* @__PURE__ */ jsx("select", { value: draft.ratio, onChange: (event) => setField("ratio", event.target.value), onMouseDown: stopCanvas, style: inputStyle, children: ["\u4FDD\u6301\u9996\u5E27\u753B\u5E45", "9:16 \u7AD6\u7248", "16:9 \u6A2A\u7248", "1:1 \u65B9\u5F62"].map((value) => /* @__PURE__ */ jsx("option", { value, children: value }, value)) })
       ] }),
       /* @__PURE__ */ jsxs("div", { children: [
-        /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u5206\u955C\u6570" }),
-        /* @__PURE__ */ jsx("select", { value: draft.sceneCount, onChange: (event) => setField("sceneCount", event.target.value), onMouseDown: stopCanvas, style: inputStyle, children: ["2", "3", "4"].map((value) => /* @__PURE__ */ jsxs("option", { value, children: [
-          value,
-          " \u4E2A\u955C\u5934"
-        ] }, value)) })
+        /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u5206\u955C\u6570\uFF08\u81EA\u586B\uFF0C1\u201320\uFF09" }),
+        /* @__PURE__ */ jsx("input", { type: "number", min: 1, max: 20, step: 1, value: draft.sceneCount, onChange: (event) => setField("sceneCount", event.target.value), onMouseDown: stopCanvas, style: inputStyle })
       ] }),
       /* @__PURE__ */ jsxs("div", { children: [
         /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u4EBA\u7269\u4E00\u81F4\u6027" }),
@@ -962,6 +1239,7 @@ function GrokProductI2VContent({ ctx }) {
         ] })
       ] })
     ] }),
+    /* @__PURE__ */ jsx("div", { style: { color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.4 }, children: "\u603B\u65F6\u957F\u662F\u6700\u7EC8\u6210\u7247\u65F6\u957F\uFF1BGrok/\u6E20\u9053\u5355\u6BB5\u6700\u591A\u6309 15 \u79D2\u8BF7\u6C42\uFF0C\u63D2\u4EF6\u4F1A\u81EA\u52A8\u5206\u6BB5\u5E76\u5728\u6D4F\u89C8\u5668\u672C\u5730\u5408\u6210\u4E3A\u4E00\u4E2A\u89C6\u9891\u3002\u82E5\u8981\u6C42\u5355\u6BB5 15 \u79D2\uFF0C\u8BF7\u5C06\u5206\u955C\u6570\u586B\u4E3A 1\u3002" }),
     /* @__PURE__ */ jsxs("details", { open: true, onMouseDown: stopCanvas, children: [
       /* @__PURE__ */ jsx("summary", { style: { cursor: "pointer", color: ctx.theme.node.muted, fontSize: 11 }, children: "\u5546\u54C1\u9501\u5B9A\u4E0E\u58F0\u97F3\uFF08\u4E25\u683C\u9996\u5E27\u6A21\u5F0F\uFF09" }),
       /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 6, paddingTop: 7 }, children: [
@@ -981,7 +1259,7 @@ function GrokProductI2VContent({ ctx }) {
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: saveTemplate, style: primaryButtonStyle, disabled: busy !== null, children: "\u751F\u6210\u6A21\u677F\u811A\u672C" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void polishWithAi(), style: buttonStyle, disabled: busy !== null, children: busy === "text" ? "AI\u6DA6\u8272\u4E2D\u2026" : "AI\u6DA6\u8272" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void createStoryboard(), style: primaryButtonStyle, disabled: busy !== null || !sourceImage, children: busy === "storyboard" ? "\u811A\u672C\u4E0E\u5206\u955C\u751F\u6210\u4E2D\u2026" : "\u4E00\u952E\u751F\u6210\u811A\u672C\u4E0E\u5206\u955C\u56FE" }),
-      /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void generateStoryboardVideos(), style: buttonStyle, disabled: busy !== null || !storedStoryboard, children: busy === "videos" ? "\u9010\u955C\u5934\u751F\u6210\u89C6\u9891\u4E2D\u2026" : "\u4E00\u952E\u751F\u6210\u89C6\u9891\uFF08\u5168\u90E8\u5206\u955C\uFF09" }),
+      /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: () => void generateStoryboardVideos(), style: buttonStyle, disabled: busy !== null || !storedStoryboard, children: busy === "videos" ? "\u751F\u6210\u5E76\u5408\u6210\u89C6\u9891\u4E2D\u2026" : "\u4E00\u952E\u751F\u6210\u89C6\u9891\uFF08\u5206\u955C+\u81EA\u52A8\u5408\u6210\uFF09" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: createTextOutput, style: buttonStyle, disabled: busy !== null, children: "\u8F93\u51FA\u6B63\u5411\u63D0\u793A\u8BCD" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: createQualityChecklist, style: buttonStyle, disabled: busy !== null, children: "\u8F93\u51FA\u8D28\u68C0\u6E05\u5355" }),
       /* @__PURE__ */ jsx("button", { type: "button", onMouseDown: stopCanvas, onClick: copyNativeXaiScript, style: buttonStyle, disabled: busy !== null, children: "\u590D\u5236\u539F\u751F xAI \u811A\u672C" }),
@@ -1020,7 +1298,7 @@ function GrokProductI2VContent({ ctx }) {
 var index_default = definePlugin({
   id: PLUGIN_ID,
   name: "Grok \u5546\u54C1\u56FE\u751F\u89C6\u9891",
-  version: "0.4.1",
+  version: "0.5.0",
   description: "\u628A\u5546\u54C1\u56FE\u548C\u6548\u679C\u63CF\u8FF0\u62C6\u6210\u811A\u672C\u3001\u5206\u955C\u9996\u5E27\u4E0E Grok \u9010\u955C\u5934\u56FE\u751F\u89C6\u9891\uFF0C\u5E76\u63D0\u4F9B\u5546\u54C1/\u4EBA\u7269\u4E00\u81F4\u6027\u7EA6\u675F\u4E0E\u8D28\u68C0\u6E05\u5355\u3002",
   nodes: [
     {
@@ -1046,6 +1324,8 @@ export {
   buildStoryboardAiPrompt,
   buildStoryboardFallback,
   index_default as default,
+  distributeSceneDurations,
+  effectiveSceneCount,
   normalizeDuration,
   normalizeSceneCount,
   parseStoryboardResponse,

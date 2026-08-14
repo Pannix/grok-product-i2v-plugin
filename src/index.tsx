@@ -51,11 +51,15 @@ type InputImage = {
 };
 
 const PLUGIN_ID = "grok-product-i2v";
-const DEFAULT_DURATION = "6";
-const DEFAULT_RATIO = "保持首帧画幅";
+const DEFAULT_DURATION = "15";
+const MAX_TOTAL_DURATION = 60;
+const MAX_SCENE_SECONDS = 15;
+const MIN_SCENE_SECONDS = 2;
+const DEFAULT_RATIO = "9:16 竖版";
 const DEFAULT_LOCK_MODE = "strict";
 const DEFAULT_SOUND = "轻微真实环境声或材质摩擦声；不要旁白、不要台词、不要音乐抢主体。";
 const DEFAULT_SCENE_COUNT = "3";
+const MAX_SCENE_COUNT = 20;
 const DEFAULT_CHARACTER_MODE = "product-only";
 
 const XAI_NATIVE_VIDEO_SCRIPT = `// 原生 xAI Grok Image-to-Video：必须把首帧放进 image 字段
@@ -123,6 +127,15 @@ const headers = { "Content-Type": "application/json", Authorization: "Bearer " +
 const sizeMatch = typeof params.size === "string" ? params.size.match(/^(\\d+)x(\\d+)$/) : null;
 const width = sizeMatch ? Number(sizeMatch[1]) : undefined;
 const height = sizeMatch ? Number(sizeMatch[2]) : undefined;
+const size = typeof params.size === "string" ? params.size : undefined;
+const aspectRatio = size === "720x1280"
+  ? "9:16"
+  : size === "1280x720"
+    ? "16:9"
+    : size === "1024x1024"
+      ? "1:1"
+      : (typeof params.ratio === "string" && params.ratio.includes(":") ? params.ratio : undefined);
+const resolution = typeof params.resolution === "string" ? params.resolution : undefined;
 
 const task = await request({
   method: "post",
@@ -135,6 +148,14 @@ const task = await request({
     duration: Number(params.seconds),
     ...(Number.isFinite(width) ? { width } : {}),
     ...(Number.isFinite(height) ? { height } : {}),
+    ...(size ? { size } : {}),
+    ...(aspectRatio ? { aspect_ratio: aspectRatio, aspectRatio, ratio: aspectRatio } : {}),
+    ...(resolution ? { resolution } : {}),
+    metadata: {
+      ...(size ? { size } : {}),
+      ...(aspectRatio ? { aspect_ratio: aspectRatio, aspectRatio, ratio: aspectRatio } : {}),
+      ...(resolution ? { resolution } : {}),
+    },
   },
 });
 
@@ -273,19 +294,35 @@ function findInputImages(ctx: CanvasNodeContentProps["ctx"]): InputImage[] {
 function normalizeDuration(value: string) {
     const parsed = Number.parseFloat(value);
     if (!Number.isFinite(parsed)) return DEFAULT_DURATION;
-    return String(Math.min(15, Math.max(2, Math.round(parsed))));
+    return String(Math.min(MAX_TOTAL_DURATION, Math.max(MIN_SCENE_SECONDS, Math.round(parsed))));
 }
 
 function normalizeSceneCount(value: string) {
     const parsed = Number.parseInt(value, 10);
     if (!Number.isFinite(parsed)) return DEFAULT_SCENE_COUNT;
-    return String(Math.min(4, Math.max(2, parsed)));
+    return String(Math.min(MAX_SCENE_COUNT, Math.max(1, parsed)));
 }
 
 function normalizeSceneDuration(value: string, fallback = "4") {
     const parsed = Number.parseFloat(value);
     if (!Number.isFinite(parsed)) return fallback;
-    return String(Math.min(10, Math.max(2, Math.round(parsed))));
+    return String(Math.min(MAX_SCENE_SECONDS, Math.max(MIN_SCENE_SECONDS, Math.round(parsed))));
+}
+
+function effectiveSceneCount(totalDuration: string, requestedCount: string) {
+    const total = Number(normalizeDuration(totalDuration));
+    const requested = Number(normalizeSceneCount(requestedCount));
+    const minimumCount = Math.ceil(total / MAX_SCENE_SECONDS);
+    const maximumCount = Math.max(1, Math.floor(total / MIN_SCENE_SECONDS));
+    return Math.min(MAX_SCENE_COUNT, Math.max(minimumCount, Math.min(requested, maximumCount)));
+}
+
+function distributeSceneDurations(totalDuration: string, count: number) {
+    const total = Number(normalizeDuration(totalDuration));
+    const safeCount = Math.max(1, Math.min(count, Math.floor(total / MIN_SCENE_SECONDS)));
+    const base = Math.floor(total / safeCount);
+    const remainder = total % safeCount;
+    return Array.from({ length: safeCount }, (_, index) => String(base + (index < remainder ? 1 : 0)));
 }
 
 function ratioInstruction(ratio: string) {
@@ -306,6 +343,206 @@ function videoNodeSize(ratio: string) {
     if (ratio === "9:16 竖版") return { width: 360, height: 640 };
     if (ratio === "1:1 方形") return { width: 420, height: 420 };
     return { width: 420, height: 236 };
+}
+
+type GeneratedClip = {
+    nodeId: string;
+    url: string;
+    sceneId: string;
+    sceneTitle: string;
+    mimeType?: string;
+    width?: number;
+    height?: number;
+    durationMs?: number;
+};
+
+type ComposedVideo = {
+    url: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    durationMs: number;
+};
+
+function compositionDimensions(ratio: string) {
+    if (ratio === "9:16 竖版") return { width: 720, height: 1280 };
+    if (ratio === "1:1 方形") return { width: 1024, height: 1024 };
+    return { width: 1280, height: 720 };
+}
+
+function waitForVideoReady(video: HTMLVideoElement) {
+    if (video.readyState >= 2) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+            video.removeEventListener("loadeddata", onReady);
+            video.removeEventListener("error", onError);
+        };
+        const onReady = () => {
+            cleanup();
+            resolve();
+        };
+        const onError = () => {
+            cleanup();
+            reject(new Error("浏览器无法读取视频源，可能是渠道视频地址不允许跨域读取。"));
+        };
+        video.addEventListener("loadeddata", onReady, { once: true });
+        video.addEventListener("error", onError, { once: true });
+    });
+}
+
+function drawVideoCover(context: CanvasRenderingContext2D, video: HTMLVideoElement, width: number, height: number) {
+    const sourceWidth = video.videoWidth || width;
+    const sourceHeight = video.videoHeight || height;
+    const sourceRatio = sourceWidth / sourceHeight;
+    const targetRatio = width / height;
+    let sx = 0;
+    let sy = 0;
+    let sw = sourceWidth;
+    let sh = sourceHeight;
+    if (sourceRatio > targetRatio) {
+        sw = sourceHeight * targetRatio;
+        sx = (sourceWidth - sw) / 2;
+    } else if (sourceRatio < targetRatio) {
+        sh = sourceWidth / targetRatio;
+        sy = (sourceHeight - sh) / 2;
+    }
+    context.fillStyle = "#000";
+    context.fillRect(0, 0, width, height);
+    context.drawImage(video, sx, sy, sw, sh, 0, 0, width, height);
+}
+
+function recordVideoFrames(video: HTMLVideoElement, context: CanvasRenderingContext2D, width: number, height: number) {
+    return new Promise<void>((resolve, reject) => {
+        let frameId = 0;
+        let settled = false;
+        const finish = (error?: Error) => {
+            if (settled) return;
+            settled = true;
+            window.cancelAnimationFrame(frameId);
+            if (error) reject(error);
+            else resolve();
+        };
+        const draw = () => {
+            try {
+                drawVideoCover(context, video, width, height);
+            } catch {
+                finish(new Error("视频跨域策略阻止了自动合成，请保留使用下方分镜视频。"));
+                return;
+            }
+            if (video.ended) {
+                finish();
+                return;
+            }
+            frameId = window.requestAnimationFrame(draw);
+        };
+        video.addEventListener("ended", () => finish(), { once: true });
+        video.addEventListener("error", () => finish(new Error("视频播放失败，无法完成自动合成。")), { once: true });
+        draw();
+    });
+}
+
+async function composeVideoUrls(urls: string[], ratio: string): Promise<ComposedVideo> {
+    if (!urls.length) throw new Error("没有可合成的视频片段。");
+    if (typeof document === "undefined" || typeof MediaRecorder === "undefined" || typeof HTMLCanvasElement === "undefined" || !HTMLCanvasElement.prototype.captureStream) {
+        throw new Error("当前浏览器不支持自动合成；请使用新版 Chrome，或手动使用下方分镜视频。");
+    }
+    const { width, height } = compositionDimensions(ratio);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("浏览器无法创建视频合成画布。");
+
+    const stream = canvas.captureStream(30);
+    const mimeTypes = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
+    const mimeType = mimeTypes.find((value) => MediaRecorder.isTypeSupported(value)) || "";
+    const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8_000_000 })
+        : new MediaRecorder(stream);
+    const chunks: Blob[] = [];
+    const stopped = new Promise<void>((resolve, reject) => {
+        recorder.onstop = () => resolve();
+        recorder.onerror = () => reject(new Error("浏览器录制合成视频失败。"));
+    });
+
+    let audioContext: AudioContext | null = null;
+    let audioDestination: MediaStreamAudioDestinationNode | null = null;
+    if (typeof AudioContext !== "undefined") {
+        try {
+            audioContext = new AudioContext();
+            await audioContext.resume();
+            audioDestination = audioContext.createMediaStreamDestination();
+            const audioTrack = audioDestination.stream.getAudioTracks()[0];
+            if (audioTrack) stream.addTrack(audioTrack);
+        } catch {
+            audioContext = null;
+            audioDestination = null;
+        }
+    }
+
+    recorder.ondataavailable = (event) => {
+        if (event.data.size) chunks.push(event.data);
+    };
+    recorder.start(500);
+    const startedAt = performance.now();
+    try {
+        for (const url of urls) {
+            const video = document.createElement("video");
+            video.crossOrigin = "anonymous";
+            video.playsInline = true;
+            video.preload = "auto";
+            video.muted = false;
+            video.style.position = "fixed";
+            video.style.left = "-10000px";
+            video.style.top = "0";
+            video.style.width = "1px";
+            video.style.height = "1px";
+            video.style.opacity = "0";
+            video.style.pointerEvents = "none";
+            document.body.appendChild(video);
+            let audioSource: MediaElementAudioSourceNode | null = null;
+            try {
+                video.src = url;
+                video.load();
+                await waitForVideoReady(video);
+                if (audioContext && audioDestination) {
+                    try {
+                        audioSource = audioContext.createMediaElementSource(video);
+                        audioSource.connect(audioDestination);
+                    } catch {
+                        audioSource = null;
+                    }
+                }
+                try {
+                    await video.play();
+                } catch {
+                    video.muted = true;
+                    await video.play();
+                }
+                await recordVideoFrames(video, context, width, height);
+            } finally {
+                audioSource?.disconnect();
+                video.pause();
+                video.removeAttribute("src");
+                video.load();
+                video.remove();
+            }
+        }
+    } finally {
+        if (recorder.state !== "inactive") recorder.stop();
+        stream.getTracks().forEach((track) => track.stop());
+        if (audioContext) await audioContext.close().catch(() => undefined);
+    }
+    await stopped;
+    const blob = new Blob(chunks, { type: mimeType || "video/webm" });
+    if (!blob.size) throw new Error("自动合成没有生成有效的视频文件。");
+    return {
+        url: URL.createObjectURL(blob),
+        mimeType: blob.type || "video/webm",
+        width,
+        height,
+        durationMs: Math.round(performance.now() - startedAt),
+    };
 }
 
 function primaryAction(brief: string) {
@@ -348,15 +585,11 @@ function characterLockText(draft: Draft, hasCharacterReference: boolean) {
 }
 
 function sceneDuration(totalDuration: string, index: number, count: number) {
-    const total = Number(totalDuration);
-    if (!Number.isFinite(total)) return "4";
-    const base = Math.max(2, Math.round(total / count));
-    if (index === count - 1) return normalizeSceneDuration(String(Math.max(2, total - base * (count - 1))), String(base));
-    return normalizeSceneDuration(String(base), "4");
+    return distributeSceneDurations(totalDuration, count)[index] || String(MIN_SCENE_SECONDS);
 }
 
 function buildStoryboardFallback(draft: Draft, hasCharacterReference: boolean): StoryboardPlan {
-    const count = Number(normalizeSceneCount(draft.sceneCount));
+    const count = effectiveSceneCount(draft.duration, draft.sceneCount);
     const action = primaryAction(draft.brief);
     const characterLock = characterLockText(draft, hasCharacterReference);
     const usesPerson = draft.characterMode !== "product-only" && hasCharacterReference;
@@ -398,7 +631,16 @@ function buildStoryboardFallback(draft: Draft, hasCharacterReference: boolean): 
             negativePrompt: "局部变成新商品，包装文字乱码，材质液化，结构穿模，过度微距，镜头跳动，突然变焦",
         },
     ];
-    const selectedScenes = count === 2 ? [scenes[0], scenes[1]] : scenes.slice(0, count);
+    const durations = distributeSceneDurations(draft.duration, count);
+    const selectedScenes = Array.from({ length: count }, (_, index) => {
+        const base = scenes[index] || scenes[scenes.length - 1];
+        return {
+            ...base,
+            id: `s${index + 1}`,
+            title: index < scenes.length ? base.title : `${base.title} ${index + 1}`,
+            duration: durations[index] || base.duration,
+        };
+    });
     return {
         title: "商品图生视频分镜",
         summary: draft.brief || "以商品主体稳定展示为主，先建立商品，再完成一个核心动作，最后稳定收尾。",
@@ -422,6 +664,7 @@ function buildStoryboardAiPrompt(draft: Draft, fallback: StoryboardPlan, hasChar
         `人物锁定规则：${characterLockText(draft, hasCharacterReference)}`,
         "请遵守：每个镜头只做一个主要任务；framePrompt 是静态分镜首帧，必须强调商品/人物身份和接触关系；videoPrompt 只描述从该静帧开始发生的动作、镜头和声音，不要重新发明构图或商品；negativePrompt 只写本镜头最可能出现的错误。",
         "以下是保守模板，若输入事实不足请沿用，不要补充未展示的商品细节：",
+        `系统实际需要输出 ${fallback.scenes.length} 个镜头；用户填写的是 ${draft.sceneCount} 个。每镜头最多按 ${MAX_SCENE_SECONDS} 秒生成，必要时保持总时长并自动分段。`,
         JSON.stringify(fallback),
     ].join("\n");
 }
@@ -447,8 +690,8 @@ function parseStoryboardResponse(text: string, fallback: StoryboardPlan): Storyb
     try {
         const parsed = JSON.parse(trimmed.slice(start, end + 1)) as Record<string, unknown>;
         const rawScenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
-        if (rawScenes.length < 2) return fallback;
-        const scenes = rawScenes.slice(0, 4).map((scene, index) => normalizeStoryboardScene(scene, index, fallback.scenes[index] || fallback.scenes[fallback.scenes.length - 1]));
+        if (rawScenes.length < 1) return fallback;
+        const scenes = rawScenes.slice(0, MAX_SCENE_COUNT).map((scene, index) => normalizeStoryboardScene(scene, index, fallback.scenes[index] || fallback.scenes[fallback.scenes.length - 1]));
         return {
             title: asString(parsed.title, fallback.title) || fallback.title,
             summary: asString(parsed.summary, fallback.summary) || fallback.summary,
@@ -462,11 +705,28 @@ function parseStoryboardResponse(text: string, fallback: StoryboardPlan): Storyb
     }
 }
 
+function normalizeStoryboardPlan(plan: StoryboardPlan, draft: Draft, fallback: StoryboardPlan): StoryboardPlan {
+    const count = effectiveSceneCount(draft.duration, draft.sceneCount);
+    const durations = distributeSceneDurations(draft.duration, count);
+    const sourceScenes = plan.scenes.length ? plan.scenes : fallback.scenes;
+    const scenes = Array.from({ length: count }, (_, index) => {
+        const source = sourceScenes[index] || sourceScenes[sourceScenes.length - 1] || fallback.scenes[fallback.scenes.length - 1];
+        const fallbackScene = fallback.scenes[index] || fallback.scenes[fallback.scenes.length - 1];
+        const normalized = normalizeStoryboardScene(source, index, fallbackScene);
+        return {
+            ...normalized,
+            id: `s${index + 1}`,
+            duration: durations[index] || fallbackScene.duration,
+        };
+    });
+    return { ...plan, scenes };
+}
+
 function parseStoredStoryboard(value: unknown): StoryboardPlan | null {
     if (typeof value !== "string" || !value.trim()) return null;
     try {
         const parsed = JSON.parse(value) as StoryboardPlan;
-        if (!parsed || !Array.isArray(parsed.scenes) || parsed.scenes.length < 2) return null;
+        if (!parsed || !Array.isArray(parsed.scenes) || parsed.scenes.length < 1) return null;
         return parsed;
     } catch {
         return null;
@@ -509,6 +769,7 @@ function inputsRoleInstruction(draft: Draft) {
 function buildSceneVideoPrompt(scene: StoryboardScene, draft: Draft, hasCharacterReference: boolean) {
     return [
         "从这张已经确认的分镜静帧开始做 Grok image-to-video。静帧负责构图、光线、商品包装和人物外观；下面只描述发生什么变化，不要重新设计画面。",
+        `本镜头时长约 ${scene.duration} 秒；总成片时长由所有镜头合并后计算。`,
         `前 0.6 秒保持首帧稳定；随后只执行一个主动作：${scene.videoPrompt}`,
         draft.characterMode === "strict-person" && hasCharacterReference ? "人物脸型、五官比例、发型和身份在整个镜头中保持一致。" : "不新增未被确认的人物、手或道具。",
         "商品主体、包装、logo、可见文字、比例和轮廓保持不变；手与商品接触时遵守真实遮挡和深度关系，不穿过、不融合、不漂浮。",
@@ -777,7 +1038,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                         model: draft.textModel || undefined,
                     });
                     const parsedPlan = parseStoryboardResponse(response.text, fallbackPlan);
-                    plan = { ...parsedPlan, scenes: parsedPlan.scenes.slice(0, Number(draft.sceneCount)) };
+                    plan = normalizeStoryboardPlan(parsedPlan, draft, fallbackPlan);
                 } catch (error) {
                     planningNotice = `AI 分镜规划不可用，已使用保守模板继续生成：${errorMessage(error)}`;
                 }
@@ -873,12 +1134,14 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
         ctx.updateMetadata({ status: "loading", errorDetails: "" });
         try {
             const prompt = `${result.positivePrompt}\n\n动态负面提示词：${result.negativePrompt}`;
-            const video = await ctx.ai.generateVideo(prompt, {
+            const generatedVideo = await ctx.ai.generateVideo(prompt, {
                 references: [asString(sourceImage.metadata?.content)],
-                seconds: draft.duration,
+                seconds: normalizeSceneDuration(draft.duration, String(MAX_SCENE_SECONDS)),
                 size: generationSize(draft.ratio),
                 model: draft.videoModel || undefined,
             });
+            const composedVideo = await composeVideoUrls([generatedVideo.url], draft.ratio);
+            const video = { ...generatedVideo, ...composedVideo };
             const size = videoNodeSize(draft.ratio);
             const id = `${PLUGIN_ID}-video-${Date.now()}`;
             ctx.applyOps([
@@ -891,7 +1154,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                     y: ctx.node.position.y + 30,
                     width: size.width,
                     height: size.height,
-                    metadata: { content: video.url, status: "success", mimeType: video.mimeType, naturalWidth: video.width, naturalHeight: video.height, durationMs: video.durationMs },
+                    metadata: { content: video.url, status: "success", mimeType: video.mimeType, naturalWidth: video.width, naturalHeight: video.height, durationMs: video.durationMs, generationMode: "video", compositionMode: "local-canvas", sourceVideoUrl: generatedVideo.url },
                 },
                 { type: "connect_nodes", fromNodeId: ctx.node.id, toNodeId: id },
             ]);
@@ -920,6 +1183,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
         ctx.updateMetadata({ status: "loading", errorDetails: "", videoBatchStatus: "生成中" });
         let completed = 0;
         const failures: string[] = [];
+        const clips: GeneratedClip[] = [];
         try {
             for (let index = 0; index < plan.scenes.length; index += 1) {
                 const scene = plan.scenes[index];
@@ -962,10 +1226,60 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                         },
                         { type: "connect_nodes", fromNodeId: imageNode.id, toNodeId: videoNodeId },
                     ]);
+                    clips.push({
+                        nodeId: videoNodeId,
+                        url: video.url,
+                        sceneId: scene.id,
+                        sceneTitle: scene.title,
+                        mimeType: video.mimeType,
+                        width: video.width,
+                        height: video.height,
+                        durationMs: video.durationMs,
+                    });
                     completed += 1;
                     ctx.updateMetadata({ videoBatchStatus: `已完成 ${completed}/${plan.scenes.length}` });
                 } catch (error) {
                     failures.push(`镜头 ${index + 1}「${scene.title}」：${errorMessage(error)}`);
+                }
+            }
+            let finalVideoNodeId = "";
+            if (!failures.length && clips.length) {
+                ctx.updateMetadata({ videoBatchStatus: `已完成 ${completed}/${plan.scenes.length}，正在合成最终 ${draft.ratio} 视频…`, videoCompositionStatus: "composing" });
+                try {
+                    const composed = await composeVideoUrls(clips.map((clip) => clip.url), draft.ratio);
+                    const finalSize = videoNodeSize(draft.ratio);
+                    finalVideoNodeId = `${PLUGIN_ID}-storyboard-final-${ctx.node.id}-${Date.now()}`;
+                    ctx.applyOps([
+                        {
+                            type: "add_node",
+                            id: finalVideoNodeId,
+                            nodeType: "video",
+                            title: "Grok 最终合成视频（" + draft.duration + " 秒）",
+                            x: ctx.node.position.x + ctx.node.width + 80 + finalSize.width + 80,
+                            y: ctx.node.position.y + 760,
+                            width: finalSize.width,
+                            height: finalSize.height,
+                            metadata: {
+                                content: composed.url,
+                                status: "success",
+                                mimeType: composed.mimeType,
+                                naturalWidth: composed.width,
+                                naturalHeight: composed.height,
+                                durationMs: composed.durationMs,
+                                generationMode: "video",
+                                compositionMode: "local-canvas",
+                                compositionRatio: draft.ratio,
+                                totalDurationSeconds: Number(draft.duration),
+                                sourceVideoNodeIds: clips.map((clip) => clip.nodeId),
+                            },
+                        },
+                        { type: "connect_nodes", fromNodeId: ctx.node.id, toNodeId: finalVideoNodeId },
+                        ...clips.map((clip) => ({ type: "connect_nodes" as const, fromNodeId: clip.nodeId, toNodeId: finalVideoNodeId })),
+                    ]);
+                    ctx.updateMetadata({ videoCompositionStatus: "success", finalVideoNodeId, videoCompositionMimeType: composed.mimeType });
+                } catch (error) {
+                    failures.push("自动合成最终视频：" + errorMessage(error));
+                    ctx.updateMetadata({ videoCompositionStatus: "error", videoCompositionError: errorMessage(error) });
                 }
             }
             const statusText = `已完成 ${completed}/${plan.scenes.length}`;
@@ -974,6 +1288,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                 videoBatchStatus: statusText,
                 errorDetails: failures.length ? `${statusText}；失败项：${failures.join("；")}` : "",
             });
+            if (finalVideoNodeId) ctx.updateMetadata({ videoBatchStatus: statusText + "，已合成最终视频", finalVideoNodeId });
         } finally {
             setBusy(null);
         }
@@ -1045,10 +1360,8 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
                 <div>
-                    <label style={labelStyle}>时长</label>
-                    <select value={draft.duration} onChange={(event) => setField("duration", event.target.value)} onMouseDown={stopCanvas} style={inputStyle}>
-                        {["4", "5", "6", "8", "10", "12", "15"].map((value) => <option key={value} value={value}>{value} 秒</option>)}
-                    </select>
+                    <label style={labelStyle}>总时长（2–60 秒）</label>
+                    <input type="number" min={2} max={60} step={1} value={draft.duration} onChange={(event) => setField("duration", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
                 </div>
                 <div>
                     <label style={labelStyle}>画幅</label>
@@ -1057,10 +1370,8 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                     </select>
                 </div>
                 <div>
-                    <label style={labelStyle}>分镜数</label>
-                    <select value={draft.sceneCount} onChange={(event) => setField("sceneCount", event.target.value)} onMouseDown={stopCanvas} style={inputStyle}>
-                        {["2", "3", "4"].map((value) => <option key={value} value={value}>{value} 个镜头</option>)}
-                    </select>
+                    <label style={labelStyle}>分镜数（自填，1–20）</label>
+                    <input type="number" min={1} max={20} step={1} value={draft.sceneCount} onChange={(event) => setField("sceneCount", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
                 </div>
                 <div>
                     <label style={labelStyle}>人物一致性</label>
@@ -1070,6 +1381,10 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                         <option value="free-person">人物自由生成：不保证脸型</option>
                     </select>
                 </div>
+            </div>
+
+            <div style={{ color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.4 }}>
+                总时长是最终成片时长；Grok/渠道单段最多按 15 秒请求，插件会自动分段并在浏览器本地合成为一个视频。若要求单段 15 秒，请将分镜数填为 1。
             </div>
 
             <details open onMouseDown={stopCanvas}>
@@ -1092,7 +1407,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                 <button type="button" onMouseDown={stopCanvas} onClick={saveTemplate} style={primaryButtonStyle} disabled={busy !== null}>生成模板脚本</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={() => void polishWithAi()} style={buttonStyle} disabled={busy !== null}>{busy === "text" ? "AI润色中…" : "AI润色"}</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={() => void createStoryboard()} style={primaryButtonStyle} disabled={busy !== null || !sourceImage}>{busy === "storyboard" ? "脚本与分镜生成中…" : "一键生成脚本与分镜图"}</button>
-                <button type="button" onMouseDown={stopCanvas} onClick={() => void generateStoryboardVideos()} style={buttonStyle} disabled={busy !== null || !storedStoryboard}>{busy === "videos" ? "逐镜头生成视频中…" : "一键生成视频（全部分镜）"}</button>
+                <button type="button" onMouseDown={stopCanvas} onClick={() => void generateStoryboardVideos()} style={buttonStyle} disabled={busy !== null || !storedStoryboard}>{busy === "videos" ? "生成并合成视频中…" : "一键生成视频（分镜+自动合成）"}</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={createTextOutput} style={buttonStyle} disabled={busy !== null}>输出正向提示词</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={createQualityChecklist} style={buttonStyle} disabled={busy !== null}>输出质检清单</button>
                 <button type="button" onMouseDown={stopCanvas} onClick={copyNativeXaiScript} style={buttonStyle} disabled={busy !== null}>复制原生 xAI 脚本</button>
@@ -1133,12 +1448,12 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
     );
 }
 
-export { buildPromptResult, buildNegativePrompt, normalizeDuration, normalizeSceneCount, promptFingerprint, storyboardFingerprint, buildStoryboardFallback, buildStoryboardAiPrompt, parseStoryboardResponse, buildSceneVideoPrompt, XAI_NATIVE_VIDEO_SCRIPT, NEW_API_VIDEO_SCRIPT };
+export { buildPromptResult, buildNegativePrompt, normalizeDuration, normalizeSceneCount, effectiveSceneCount, distributeSceneDurations, promptFingerprint, storyboardFingerprint, buildStoryboardFallback, buildStoryboardAiPrompt, parseStoryboardResponse, buildSceneVideoPrompt, XAI_NATIVE_VIDEO_SCRIPT, NEW_API_VIDEO_SCRIPT };
 
 export default definePlugin({
     id: PLUGIN_ID,
     name: "Grok 商品图生视频",
-    version: "0.4.1",
+    version: "0.5.0",
     description: "把商品图和效果描述拆成脚本、分镜首帧与 Grok 逐镜头图生视频，并提供商品/人物一致性约束与质检清单。",
     nodes: [
         {
