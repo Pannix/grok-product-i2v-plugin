@@ -16,6 +16,11 @@ type Draft = {
     videoModel: string;
     sceneCount: string;
     characterMode: string;
+    productRefCount: string;
+    contentRefCount: string;
+    personRefCount: string;
+    styleRefCount: string;
+    referenceCountsConfigured: boolean;
 };
 
 type PromptResult = {
@@ -50,6 +55,16 @@ type InputImage = {
     title: string;
 };
 
+type ReferenceRole = "product" | "content" | "person" | "style";
+
+type ReferenceGroups = {
+    product: InputImage[];
+    content: InputImage[];
+    person: InputImage[];
+    style: InputImage[];
+    unassigned: InputImage[];
+};
+
 const PLUGIN_ID = "grok-product-i2v";
 const DEFAULT_DURATION = "15";
 const MAX_TOTAL_DURATION = 60;
@@ -61,6 +76,11 @@ const DEFAULT_SOUND = "轻微真实环境声或材质摩擦声；不要旁白、
 const DEFAULT_SCENE_COUNT = "3";
 const MAX_SCENE_COUNT = 20;
 const DEFAULT_CHARACTER_MODE = "product-only";
+const MAX_REFERENCE_IMAGES_PER_GROUP = 3;
+const DEFAULT_PRODUCT_REF_COUNT = "1";
+const DEFAULT_CONTENT_REF_COUNT = "0";
+const DEFAULT_PERSON_REF_COUNT = "0";
+const DEFAULT_STYLE_REF_COUNT = "0";
 
 const XAI_NATIVE_VIDEO_SCRIPT = `// 原生 xAI Grok Image-to-Video：必须把首帧放进 image 字段
 const source = images[0];
@@ -248,6 +268,7 @@ function metadataText(metadata: CanvasNodeMetadata | undefined, key: string, fal
 
 function readDraft(ctx: CanvasNodeContentProps["ctx"]): Draft {
     const metadata = ctx.node.metadata;
+    const referenceCountsConfigured = ["productRefCount", "contentRefCount", "personRefCount", "styleRefCount"].some((key) => metadata?.[key] !== undefined);
     const upstreamBrief = ctx
         .getUpstream()
         .filter((node) => node.type === "text" || node.type === "markdown:doc")
@@ -270,6 +291,11 @@ function readDraft(ctx: CanvasNodeContentProps["ctx"]): Draft {
         videoModel: metadataText(metadata, "videoModel"),
         sceneCount: normalizeSceneCount(metadataText(metadata, "sceneCount", DEFAULT_SCENE_COUNT)),
         characterMode: metadataText(metadata, "characterMode", DEFAULT_CHARACTER_MODE),
+        productRefCount: normalizeReferenceCount(metadataText(metadata, "productRefCount", DEFAULT_PRODUCT_REF_COUNT), DEFAULT_PRODUCT_REF_COUNT),
+        contentRefCount: normalizeReferenceCount(metadataText(metadata, "contentRefCount", DEFAULT_CONTENT_REF_COUNT), DEFAULT_CONTENT_REF_COUNT),
+        personRefCount: normalizeReferenceCount(metadataText(metadata, "personRefCount", DEFAULT_PERSON_REF_COUNT), DEFAULT_PERSON_REF_COUNT),
+        styleRefCount: normalizeReferenceCount(metadataText(metadata, "styleRefCount", DEFAULT_STYLE_REF_COUNT), DEFAULT_STYLE_REF_COUNT),
+        referenceCountsConfigured,
     };
 }
 
@@ -289,6 +315,80 @@ function findInputImages(ctx: CanvasNodeContentProps["ctx"]): InputImage[] {
         .filter((node) => isImageNode(node))
         .map((node) => ({ node, content: asString(node.metadata?.content), title: node.title || "图片参考" }))
         .filter((item) => Boolean(item.content));
+}
+
+function normalizeReferenceCount(value: string, fallback = "0") {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return String(Math.min(MAX_REFERENCE_IMAGES_PER_GROUP, Math.max(0, parsed)));
+}
+
+function referenceRoleHint(input: InputImage): ReferenceRole | null {
+    const metadata = input.node.metadata;
+    const explicit = `${asString(metadata?.referenceRole)} ${asString(metadata?.referenceType)} ${input.title}`.toLowerCase();
+    if (/(内容物|内装|内含|成分|原料|配料|瓶内|盒内|随附|配件|content|ingredient|inside)/i.test(explicit)) return "content";
+    if (/(人物|人像|模特|脸型|肖像|女生|男生|person|portrait|model|face)/i.test(explicit)) return "person";
+    if (/(风格|场景|背景|氛围|光影|style|scene|background|mood)/i.test(explicit)) return "style";
+    if (/(商品|产品|主图|包装|sku|product|package)/i.test(explicit)) return "product";
+    return null;
+}
+
+function emptyReferenceGroups(): ReferenceGroups {
+    return { product: [], content: [], person: [], style: [], unassigned: [] };
+}
+
+function referenceTargets(draft: Draft) {
+    return {
+        product: Math.max(1, Number(normalizeReferenceCount(draft.productRefCount, DEFAULT_PRODUCT_REF_COUNT))),
+        content: Number(normalizeReferenceCount(draft.contentRefCount, DEFAULT_CONTENT_REF_COUNT)),
+        person: Number(normalizeReferenceCount(draft.personRefCount, DEFAULT_PERSON_REF_COUNT)),
+        style: Number(normalizeReferenceCount(draft.styleRefCount, DEFAULT_STYLE_REF_COUNT)),
+    } satisfies Record<ReferenceRole, number>;
+}
+
+function groupInputImages(inputs: InputImage[], draft: Draft): ReferenceGroups {
+    const groups = emptyReferenceGroups();
+    const targets = referenceTargets(draft);
+    const used = new Set<string>();
+    const roleOrder: ReferenceRole[] = ["product", "content", "person", "style"];
+    const add = (role: ReferenceRole, input: InputImage) => {
+        if (used.has(input.node.id) || groups[role].length >= MAX_REFERENCE_IMAGES_PER_GROUP) return false;
+        groups[role].push(input);
+        used.add(input.node.id);
+        return true;
+    };
+
+    for (const input of inputs) {
+        const hint = referenceRoleHint(input);
+        if (hint) add(hint, input);
+    }
+
+    const unclassified = inputs.filter((input) => !used.has(input.node.id));
+    if (draft.referenceCountsConfigured) {
+        for (const role of roleOrder) {
+            while (groups[role].length < targets[role] && unclassified.length) {
+                add(role, unclassified.shift() as InputImage);
+            }
+        }
+    } else {
+        if (!groups.product.length && unclassified.length) add("product", unclassified.shift() as InputImage);
+        if (draft.characterMode === "strict-person" && !groups.person.length && unclassified.length) add("person", unclassified.shift() as InputImage);
+        while (unclassified.length) add("style", unclassified.shift() as InputImage);
+    }
+
+    groups.unassigned = inputs.filter((input) => !used.has(input.node.id));
+    return groups;
+}
+
+function referenceGroupEntries(groups: ReferenceGroups) {
+    return (["product", "content", "person", "style"] as ReferenceRole[]).flatMap((role) => groups[role].map((input) => ({ input, role })));
+}
+
+function referenceRoleLabel(role: ReferenceRole) {
+    if (role === "product") return "商品";
+    if (role === "content") return "内容物";
+    if (role === "person") return "人物";
+    return "风格";
 }
 
 function normalizeDuration(value: string) {
@@ -570,7 +670,7 @@ function splitLines(value: string) {
 }
 
 function promptFingerprint(draft: Draft) {
-    return [draft.brief, draft.productFacts, draft.mustKeep, draft.allowedChange, draft.forbidden, draft.sound, draft.duration, draft.ratio, draft.lockMode, draft.sceneCount, draft.characterMode].join("\u241f");
+    return [draft.brief, draft.productFacts, draft.mustKeep, draft.allowedChange, draft.forbidden, draft.sound, draft.duration, draft.ratio, draft.lockMode, draft.sceneCount, draft.characterMode, draft.productRefCount, draft.contentRefCount, draft.personRefCount, draft.styleRefCount].join("\u241f");
 }
 
 function storyboardFingerprint(draft: Draft) {
@@ -579,8 +679,8 @@ function storyboardFingerprint(draft: Draft) {
 
 function characterLockText(draft: Draft, hasCharacterReference: boolean) {
     if (draft.characterMode === "product-only") return "本项目不安排人物；不要新增人物、手或人物道具。";
-    if (draft.characterMode === "strict-person" && hasCharacterReference) return "使用第二张上游人物参考图锁定同一人物的脸型、五官比例、发型、肤色和整体身份；人物动作可以变化，脸部结构不要变化。";
-    if (draft.characterMode === "strict-person") return "用户要求人物一致，但未连接第二张人物参考图；无法建立可靠的人物身份锁定，必须先补充人物参考图。";
+    if (draft.characterMode === "strict-person" && hasCharacterReference) return "使用人物参考图组锁定同一人物的脸型、五官比例、发型、肤色和整体身份；人物动作可以变化，脸部结构不要变化。";
+    if (draft.characterMode === "strict-person") return "用户要求人物一致，但未连接人物参考图；无法建立可靠的人物身份锁定，必须先补充人物参考图。";
     return "允许出现人物，但未启用人物身份锁定；不要把此模式描述为脸型一致保证。";
 }
 
@@ -651,8 +751,24 @@ function buildStoryboardFallback(draft: Draft, hasCharacterReference: boolean): 
     };
 }
 
-function buildStoryboardAiPrompt(draft: Draft, fallback: StoryboardPlan, hasCharacterReference: boolean) {
+function referenceRoleInstruction(draft: Draft, groups?: ReferenceGroups) {
+    const counts = groups
+        ? { product: groups.product.length, content: groups.content.length, person: groups.person.length, style: groups.style.length }
+        : referenceTargets(draft);
+    const lines = [
+        "参考图分组顺序：商品 " + counts.product + " 张；内容物 " + counts.content + " 张；人物 " + counts.person + " 张；风格 " + counts.style + " 张。",
+        "商品参考图组只用于锁定商品身份、包装、轮廓、比例、颜色、材质、配件和可见文字。",
+        "内容物参考图组只用于确认商品内部或随附内容物的可见事实，不得把内容物替换成另一个商品，不得凭空补全未展示的内部结构。",
+        "人物参考图组只用于锁定同一人物的脸型、五官比例、发型、肤色和身份；风格参考图组只用于借鉴场景、光影、色调和构图氛围，不能改变商品或人物身份。",
+    ];
+    if (groups?.unassigned.length) lines.push("另有 " + groups.unassigned.length + " 张未分组参考图，只能作为补充视觉参考，不得覆盖商品参考图组的身份事实。");
+    return lines.join(" ");
+}
+
+function buildStoryboardAiPrompt(draft: Draft, fallback: StoryboardPlan, hasCharacterReference: boolean, groups?: ReferenceGroups) {
+    const roleInstruction = referenceRoleInstruction(draft, groups);
     return [
+        roleInstruction,
         `请生成 ${draft.sceneCount} 个商品广告短镜头的结构化分镜。`,
         `用户想要的效果：${draft.brief || "稳定展示商品材质与轮廓"}`,
         `商品事实：${draft.productFacts || "没有额外事实，只以商品参考图中实际可见内容为准"}`,
@@ -734,26 +850,25 @@ function parseStoredStoryboard(value: unknown): StoryboardPlan | null {
 }
 
 function storyboardReferences(inputs: InputImage[], draft: Draft) {
-    const refs = [inputs[0]?.content].filter(Boolean) as string[];
-    if (draft.characterMode === "product-only") {
-        if (inputs[1]?.content) refs.push(inputs[1].content);
-    } else {
-        if (inputs[1]?.content) refs.push(inputs[1].content);
-        if (inputs[2]?.content) refs.push(inputs[2].content);
-    }
-    return refs;
+    const groups = groupInputImages(inputs, draft);
+    return [
+        ...referenceGroupEntries(groups).map(({ input }) => input.content),
+        ...groups.unassigned.map((input) => input.content),
+    ].filter(Boolean);
 }
 
-function buildSceneFramePrompt(scene: StoryboardScene, draft: Draft, hasCharacterReference: boolean) {
+function buildSceneFramePrompt(scene: StoryboardScene, draft: Draft, hasCharacterReference: boolean, groups?: ReferenceGroups) {
+    const roleInstruction = referenceRoleInstruction(draft, groups);
     return [
         "生成一张商品广告分镜静帧，不要生成视频，不要拼贴多个镜头。",
         "第一张参考图是商品身份的唯一事实基准：必须保持商品原包装、logo、可见文字、轮廓、比例、颜色、材质、配件和关键细节，不改款、不换包装、不重新设计正面版式。",
+        roleInstruction,
         draft.characterMode === "strict-person" && hasCharacterReference
-            ? "第二张参考图是人物身份基准：保持同一人物的脸型、五官比例、发型、肤色和整体身份；不要变脸、换人或改变头身比例。"
+            ? "人物参考图组是人物身份基准：保持同一人物的脸型、五官比例、发型、肤色和整体身份；不要变脸、换人或改变头身比例。"
             : draft.characterMode === "product-only"
                 ? "本镜头不新增人物、手或人物道具。"
                 : "人物身份未被严格锁定；不要声称人物脸型已获得保证。",
-        inputsRoleInstruction(draft),
+        inputsRoleInstruction(draft, groups),
         `镜头任务：${scene.purpose}`,
         `分镜首帧设计：${scene.framePrompt}`,
         `画幅：${draft.ratio}。商品主体完整，关键包装文字不被遮挡。若有人物/手与商品互动，接触点清晰、前后关系真实，不能穿模。`,
@@ -761,9 +876,8 @@ function buildSceneFramePrompt(scene: StoryboardScene, draft: Draft, hasCharacte
     ].join("\n");
 }
 
-function inputsRoleInstruction(draft: Draft) {
-    if (draft.characterMode === "product-only") return "连接顺序：第 1 张是商品图；第 2、3 张即使存在也只可作为风格参考，不能改变商品身份。";
-    return "连接顺序：第 1 张是商品图，第 2 张是人物参考图，第 3 张可选为风格参考；不得把风格参考误当成商品或人物身份。";
+function inputsRoleInstruction(draft: Draft, groups?: ReferenceGroups) {
+    return referenceRoleInstruction(draft, groups);
 }
 
 function buildSceneVideoPrompt(scene: StoryboardScene, draft: Draft, hasCharacterReference: boolean) {
@@ -779,13 +893,15 @@ function buildSceneVideoPrompt(scene: StoryboardScene, draft: Draft, hasCharacte
     ].join("\n");
 }
 
-function renderStoryboardMarkdown(plan: StoryboardPlan, sourceLabel: string, hasCharacterReference: boolean) {
+function renderStoryboardMarkdown(plan: StoryboardPlan, sourceLabel: string, hasCharacterReference: boolean, draft: Draft, groups?: ReferenceGroups) {
+    const roleInstruction = referenceRoleInstruction(draft, groups);
     return [
         "# Grok 商品广告脚本与分镜",
         "",
         `- 标题：${plan.title}`,
         `- 商品首帧：${sourceLabel || "未连接"}`,
-        `- 人物参考：${hasCharacterReference ? "已连接第二张上游人物图" : "未连接"}`,
+        `- 人物参考：${hasCharacterReference ? "已连接人物参考图组" : "未连接"}`,
+        `- 参考图分组：${roleInstruction}`,
         `- 整体目标：${plan.summary}`,
         `- 商品锁定：${plan.productLock}`,
         `- 人物锁定：${plan.characterLock}`,
@@ -963,9 +1079,10 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
     const [busy, setBusy] = useState<"template" | "text" | "storyboard" | "video" | "videos" | null>(null);
     const draft = readDraft(ctx);
     const inputImages = findInputImages(ctx);
-    const sourceImage = inputImages[0]?.node || null;
-    const sourceLabel = inputImages[0]?.title || "商品首帧";
-    const hasCharacterReference = Boolean(inputImages[1]?.content);
+    const referenceGroups = groupInputImages(inputImages, draft);
+    const sourceImage = referenceGroups.product[0]?.node || null;
+    const sourceLabel = referenceGroups.product[0]?.title || "商品首帧";
+    const hasCharacterReference = referenceGroups.person.length > 0;
     const output = metadataText(ctx.node.metadata, "content");
     const storyboardMarkdown = metadataText(ctx.node.metadata, "storyboardMarkdown");
     const positivePrompt = metadataText(ctx.node.metadata, "positivePrompt");
@@ -976,7 +1093,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
     const imageModels = useMemo(() => ctx.ai.listModels("image"), [ctx.ai]);
     const videoModels = useMemo(() => ctx.ai.listModels("video"), [ctx.ai]);
 
-    const promptFields = new Set(["brief", "productFacts", "mustKeep", "allowedChange", "forbidden", "sound", "duration", "ratio", "lockMode", "sceneCount", "characterMode", "imageModel"]);
+    const promptFields = new Set(["brief", "productFacts", "mustKeep", "allowedChange", "forbidden", "sound", "duration", "ratio", "lockMode", "sceneCount", "characterMode", "imageModel", "productRefCount", "contentRefCount", "personRefCount", "styleRefCount"]);
     const setField = (key: string, value: string) => ctx.updateMetadata({ [key]: value, ...(promptFields.has(key) ? { content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "", storyboardPlan: "", storyboardMarkdown: "", storyboardFingerprint: "", storyboardNotice: "" } : {}) });
     const stopCanvas = (event: { stopPropagation: () => void }) => event.stopPropagation();
     const fallback = () => buildPromptResult(draft, sourceLabel, Boolean(sourceImage));
@@ -1021,11 +1138,12 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
             return;
         }
         if (draft.characterMode === "strict-person" && !hasCharacterReference) {
-            ctx.updateMetadata({ status: "error", errorDetails: "人物锁定模式需要第二张上游图片作为人物参考图。请按顺序连接：商品图 → 人物图 →（可选）风格图。" });
+            ctx.updateMetadata({ status: "error", errorDetails: "人物锁定模式需要人物参考图。请设置人物参考图数量，或给人物图片节点标题加上“人物/模特/人像”等关键词；连接顺序为商品 → 内容物 → 人物 → 风格。" });
             return;
         }
         const fallbackPlan = buildStoryboardFallback(draft, hasCharacterReference);
         const references = storyboardReferences(inputImages, draft);
+        const storyboardGroups = groupInputImages(inputImages, draft);
         let plan = fallbackPlan;
         let planningNotice = "";
         setBusy("storyboard");
@@ -1033,7 +1151,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
         try {
             if (textModels.length) {
                 try {
-                    const response = await ctx.ai.generateText(buildStoryboardAiPrompt(draft, fallbackPlan, hasCharacterReference), {
+                    const response = await ctx.ai.generateText(buildStoryboardAiPrompt(draft, fallbackPlan, hasCharacterReference, storyboardGroups), {
                         system: STORYBOARD_SYSTEM,
                         model: draft.textModel || undefined,
                     });
@@ -1048,7 +1166,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
 
             for (let index = 0; index < plan.scenes.length; index += 1) {
                 const scene = plan.scenes[index];
-                const generated = await ctx.ai.generateImage(buildSceneFramePrompt(scene, draft, hasCharacterReference), {
+                const generated = await ctx.ai.generateImage(buildSceneFramePrompt(scene, draft, hasCharacterReference, storyboardGroups), {
                     references,
                     size: generationSize(draft.ratio),
                     count: 1,
@@ -1077,7 +1195,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                             mimeType: imageContent.match(/^data:([^;]+);/)?.[1] || "image/png",
                             generationMode: "image",
                             generationType: "edit",
-                            prompt: buildSceneFramePrompt(scene, draft, hasCharacterReference),
+                            prompt: buildSceneFramePrompt(scene, draft, hasCharacterReference, storyboardGroups),
                             storyboardOwnerId: ctx.node.id,
                             storyboardSceneId: scene.id,
                             storyboardSceneIndex: index,
@@ -1088,7 +1206,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                 ]);
                 ctx.updateMetadata({ storyboardPlan: JSON.stringify(plan) });
             }
-            const markdown = renderStoryboardMarkdown(plan, sourceLabel, hasCharacterReference);
+            const markdown = renderStoryboardMarkdown(plan, sourceLabel, hasCharacterReference, draft, storyboardGroups);
             ctx.updateMetadata({
                 content: markdown,
                 storyboardMarkdown: markdown,
@@ -1336,21 +1454,53 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
 
             {inputImages.length ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: 5, padding: 6, borderRadius: 8, background: ctx.theme.toolbar.panel }}>
-                    {inputImages.slice(0, 3).map((input, index) => (
+                    {referenceGroupEntries(referenceGroups).map(({ input, role }) => (
                         <div key={input.node.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
                             <img src={input.content} alt={input.title} style={{ width: 42, height: 34, borderRadius: 5, objectFit: "contain", background: "#fff" }} />
                             <div style={{ minWidth: 0, fontSize: 11, color: ctx.theme.node.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                {index === 0 ? "商品图" : index === 1 ? "人物参考" : "风格参考"}：{input.title}
+                                {referenceRoleLabel(role)}参考图：{input.title}
                             </div>
                         </div>
                     ))}
+                    {referenceGroups.unassigned.map((input) => (
+                        <div key={input.node.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                            <img src={input.content} alt={input.title} style={{ width: 42, height: 34, borderRadius: 5, objectFit: "contain", background: "#fff" }} />
+                            <div style={{ minWidth: 0, fontSize: 11, color: "#d97706", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                未分组参考图：{input.title}
+                            </div>
+                        </div>
+                    ))}
+                    {referenceGroups.unassigned.length ? <div style={{ color: "#d97706", fontSize: 10, lineHeight: 1.35 }}>有图片未落入四组，仍会传给分镜模型，但建议填写各组数量或给图片节点标题加上角色关键词。</div> : null}
                 </div>
             ) : (
                 <div style={{ padding: 8, borderRadius: 8, background: "#f59e0b14", color: ctx.theme.node.muted, fontSize: 11, lineHeight: 1.45 }}>把画布里的商品图片节点连接到本节点。脚本可以先生成，但生成分镜图和视频都需要商品图。</div>
             )}
 
             <div style={{ padding: 7, borderRadius: 8, background: "#2563eb12", color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.45 }}>
-                参考图连接顺序：第 1 张商品图；第 2 张人物图（要锁脸型时必接）；第 3 张可选风格图。人物和风格图不能替代商品图。
+                参考图按四组连接：商品 → 内容物 → 人物 → 风格；每组最多 3 张。填写下面的数量后，未标注图片按组顺序归类；图片标题含“内容物/人物/风格”等关键词时会自动识别。人物和风格图不能替代商品图。
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                <div>
+                    <label style={labelStyle}>商品参考图（1–3 张）</label>
+                    <input type="number" min={1} max={3} step={1} value={draft.productRefCount} onChange={(event) => setField("productRefCount", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
+                </div>
+                <div>
+                    <label style={labelStyle}>内容物参考图（0–3 张）</label>
+                    <input type="number" min={0} max={3} step={1} value={draft.contentRefCount} onChange={(event) => setField("contentRefCount", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
+                </div>
+                <div>
+                    <label style={labelStyle}>人物参考图（0–3 张）</label>
+                    <input type="number" min={0} max={3} step={1} value={draft.personRefCount} onChange={(event) => setField("personRefCount", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
+                </div>
+                <div>
+                    <label style={labelStyle}>风格参考图（0–3 张）</label>
+                    <input type="number" min={0} max={3} step={1} value={draft.styleRefCount} onChange={(event) => setField("styleRefCount", event.target.value)} onMouseDown={stopCanvas} style={inputStyle} />
+                </div>
+            </div>
+
+            <div style={{ color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.4 }}>
+                未修改数量时兼容旧节点顺序：商品 →（严格人物模式时人物）→ 风格；修改任意一项数量后启用四组精确分配。每组最多 3 张，超出的图片会标记为未分组并继续作为补充参考传入。
             </div>
 
             <div>
@@ -1377,7 +1527,7 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
                     <label style={labelStyle}>人物一致性</label>
                     <select value={draft.characterMode} onChange={(event) => setField("characterMode", event.target.value)} onMouseDown={stopCanvas} style={inputStyle}>
                         <option value="product-only">商品展示：不加人物</option>
-                        <option value="strict-person">人物锁定：必须连接第二张人物图</option>
+                        <option value="strict-person">人物锁定：必须连接人物参考图组</option>
                         <option value="free-person">人物自由生成：不保证脸型</option>
                     </select>
                 </div>
@@ -1448,12 +1598,12 @@ function GrokProductI2VContent({ ctx }: CanvasNodeContentProps) {
     );
 }
 
-export { buildPromptResult, buildNegativePrompt, normalizeDuration, normalizeSceneCount, effectiveSceneCount, distributeSceneDurations, promptFingerprint, storyboardFingerprint, buildStoryboardFallback, buildStoryboardAiPrompt, parseStoryboardResponse, buildSceneVideoPrompt, XAI_NATIVE_VIDEO_SCRIPT, NEW_API_VIDEO_SCRIPT };
+export { buildPromptResult, buildNegativePrompt, normalizeDuration, normalizeSceneCount, normalizeReferenceCount, effectiveSceneCount, distributeSceneDurations, promptFingerprint, storyboardFingerprint, buildStoryboardFallback, buildStoryboardAiPrompt, parseStoryboardResponse, buildSceneVideoPrompt, groupInputImages, referenceRoleHint, XAI_NATIVE_VIDEO_SCRIPT, NEW_API_VIDEO_SCRIPT };
 
 export default definePlugin({
     id: PLUGIN_ID,
     name: "Grok 商品图生视频",
-    version: "0.5.0",
+    version: "0.6.0",
     description: "把商品图和效果描述拆成脚本、分镜首帧与 Grok 逐镜头图生视频，并提供商品/人物一致性约束与质检清单。",
     nodes: [
         {

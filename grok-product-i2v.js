@@ -42,6 +42,11 @@ var DEFAULT_SOUND = "\u8F7B\u5FAE\u771F\u5B9E\u73AF\u5883\u58F0\u6216\u6750\u8D2
 var DEFAULT_SCENE_COUNT = "3";
 var MAX_SCENE_COUNT = 20;
 var DEFAULT_CHARACTER_MODE = "product-only";
+var MAX_REFERENCE_IMAGES_PER_GROUP = 3;
+var DEFAULT_PRODUCT_REF_COUNT = "1";
+var DEFAULT_CONTENT_REF_COUNT = "0";
+var DEFAULT_PERSON_REF_COUNT = "0";
+var DEFAULT_STYLE_REF_COUNT = "0";
 var XAI_NATIVE_VIDEO_SCRIPT = `// \u539F\u751F xAI Grok Image-to-Video\uFF1A\u5FC5\u987B\u628A\u9996\u5E27\u653E\u8FDB image \u5B57\u6BB5
 const source = images[0];
 if (!source) throw new Error("\u8BF7\u5148\u8FDE\u63A5\u5546\u54C1\u9996\u5E27\u56FE\u7247");
@@ -222,6 +227,7 @@ function metadataText(metadata, key, fallback = "") {
 }
 function readDraft(ctx) {
   const metadata = ctx.node.metadata;
+  const referenceCountsConfigured = ["productRefCount", "contentRefCount", "personRefCount", "styleRefCount"].some((key) => metadata?.[key] !== void 0);
   const upstreamBrief = ctx.getUpstream().filter((node) => node.type === "text" || node.type === "markdown:doc").map((node) => asString(node.metadata?.content).trim()).filter(Boolean).join("\n");
   return {
     brief: metadataText(metadata, "brief", upstreamBrief),
@@ -237,7 +243,12 @@ function readDraft(ctx) {
     imageModel: metadataText(metadata, "imageModel"),
     videoModel: metadataText(metadata, "videoModel"),
     sceneCount: normalizeSceneCount(metadataText(metadata, "sceneCount", DEFAULT_SCENE_COUNT)),
-    characterMode: metadataText(metadata, "characterMode", DEFAULT_CHARACTER_MODE)
+    characterMode: metadataText(metadata, "characterMode", DEFAULT_CHARACTER_MODE),
+    productRefCount: normalizeReferenceCount(metadataText(metadata, "productRefCount", DEFAULT_PRODUCT_REF_COUNT), DEFAULT_PRODUCT_REF_COUNT),
+    contentRefCount: normalizeReferenceCount(metadataText(metadata, "contentRefCount", DEFAULT_CONTENT_REF_COUNT), DEFAULT_CONTENT_REF_COUNT),
+    personRefCount: normalizeReferenceCount(metadataText(metadata, "personRefCount", DEFAULT_PERSON_REF_COUNT), DEFAULT_PERSON_REF_COUNT),
+    styleRefCount: normalizeReferenceCount(metadataText(metadata, "styleRefCount", DEFAULT_STYLE_REF_COUNT), DEFAULT_STYLE_REF_COUNT),
+    referenceCountsConfigured
   };
 }
 function isImageNode(node) {
@@ -247,6 +258,70 @@ function isImageNode(node) {
 }
 function findInputImages(ctx) {
   return ctx.getUpstream().filter((node) => isImageNode(node)).map((node) => ({ node, content: asString(node.metadata?.content), title: node.title || "\u56FE\u7247\u53C2\u8003" })).filter((item) => Boolean(item.content));
+}
+function normalizeReferenceCount(value, fallback = "0") {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return String(Math.min(MAX_REFERENCE_IMAGES_PER_GROUP, Math.max(0, parsed)));
+}
+function referenceRoleHint(input) {
+  const metadata = input.node.metadata;
+  const explicit = `${asString(metadata?.referenceRole)} ${asString(metadata?.referenceType)} ${input.title}`.toLowerCase();
+  if (/(内容物|内装|内含|成分|原料|配料|瓶内|盒内|随附|配件|content|ingredient|inside)/i.test(explicit)) return "content";
+  if (/(人物|人像|模特|脸型|肖像|女生|男生|person|portrait|model|face)/i.test(explicit)) return "person";
+  if (/(风格|场景|背景|氛围|光影|style|scene|background|mood)/i.test(explicit)) return "style";
+  if (/(商品|产品|主图|包装|sku|product|package)/i.test(explicit)) return "product";
+  return null;
+}
+function emptyReferenceGroups() {
+  return { product: [], content: [], person: [], style: [], unassigned: [] };
+}
+function referenceTargets(draft) {
+  return {
+    product: Math.max(1, Number(normalizeReferenceCount(draft.productRefCount, DEFAULT_PRODUCT_REF_COUNT))),
+    content: Number(normalizeReferenceCount(draft.contentRefCount, DEFAULT_CONTENT_REF_COUNT)),
+    person: Number(normalizeReferenceCount(draft.personRefCount, DEFAULT_PERSON_REF_COUNT)),
+    style: Number(normalizeReferenceCount(draft.styleRefCount, DEFAULT_STYLE_REF_COUNT))
+  };
+}
+function groupInputImages(inputs, draft) {
+  const groups = emptyReferenceGroups();
+  const targets = referenceTargets(draft);
+  const used = /* @__PURE__ */ new Set();
+  const roleOrder = ["product", "content", "person", "style"];
+  const add = (role, input) => {
+    if (used.has(input.node.id) || groups[role].length >= MAX_REFERENCE_IMAGES_PER_GROUP) return false;
+    groups[role].push(input);
+    used.add(input.node.id);
+    return true;
+  };
+  for (const input of inputs) {
+    const hint = referenceRoleHint(input);
+    if (hint) add(hint, input);
+  }
+  const unclassified = inputs.filter((input) => !used.has(input.node.id));
+  if (draft.referenceCountsConfigured) {
+    for (const role of roleOrder) {
+      while (groups[role].length < targets[role] && unclassified.length) {
+        add(role, unclassified.shift());
+      }
+    }
+  } else {
+    if (!groups.product.length && unclassified.length) add("product", unclassified.shift());
+    if (draft.characterMode === "strict-person" && !groups.person.length && unclassified.length) add("person", unclassified.shift());
+    while (unclassified.length) add("style", unclassified.shift());
+  }
+  groups.unassigned = inputs.filter((input) => !used.has(input.node.id));
+  return groups;
+}
+function referenceGroupEntries(groups) {
+  return ["product", "content", "person", "style"].flatMap((role) => groups[role].map((input) => ({ input, role })));
+}
+function referenceRoleLabel(role) {
+  if (role === "product") return "\u5546\u54C1";
+  if (role === "content") return "\u5185\u5BB9\u7269";
+  if (role === "person") return "\u4EBA\u7269";
+  return "\u98CE\u683C";
 }
 function normalizeDuration(value) {
   const parsed = Number.parseFloat(value);
@@ -484,15 +559,15 @@ function splitLines(value) {
   return value.split(/[\n,，;；]/).map((item) => item.trim()).filter(Boolean);
 }
 function promptFingerprint(draft) {
-  return [draft.brief, draft.productFacts, draft.mustKeep, draft.allowedChange, draft.forbidden, draft.sound, draft.duration, draft.ratio, draft.lockMode, draft.sceneCount, draft.characterMode].join("\u241F");
+  return [draft.brief, draft.productFacts, draft.mustKeep, draft.allowedChange, draft.forbidden, draft.sound, draft.duration, draft.ratio, draft.lockMode, draft.sceneCount, draft.characterMode, draft.productRefCount, draft.contentRefCount, draft.personRefCount, draft.styleRefCount].join("\u241F");
 }
 function storyboardFingerprint(draft) {
   return `${promptFingerprint(draft)}\u241F${draft.imageModel}`;
 }
 function characterLockText(draft, hasCharacterReference) {
   if (draft.characterMode === "product-only") return "\u672C\u9879\u76EE\u4E0D\u5B89\u6392\u4EBA\u7269\uFF1B\u4E0D\u8981\u65B0\u589E\u4EBA\u7269\u3001\u624B\u6216\u4EBA\u7269\u9053\u5177\u3002";
-  if (draft.characterMode === "strict-person" && hasCharacterReference) return "\u4F7F\u7528\u7B2C\u4E8C\u5F20\u4E0A\u6E38\u4EBA\u7269\u53C2\u8003\u56FE\u9501\u5B9A\u540C\u4E00\u4EBA\u7269\u7684\u8138\u578B\u3001\u4E94\u5B98\u6BD4\u4F8B\u3001\u53D1\u578B\u3001\u80A4\u8272\u548C\u6574\u4F53\u8EAB\u4EFD\uFF1B\u4EBA\u7269\u52A8\u4F5C\u53EF\u4EE5\u53D8\u5316\uFF0C\u8138\u90E8\u7ED3\u6784\u4E0D\u8981\u53D8\u5316\u3002";
-  if (draft.characterMode === "strict-person") return "\u7528\u6237\u8981\u6C42\u4EBA\u7269\u4E00\u81F4\uFF0C\u4F46\u672A\u8FDE\u63A5\u7B2C\u4E8C\u5F20\u4EBA\u7269\u53C2\u8003\u56FE\uFF1B\u65E0\u6CD5\u5EFA\u7ACB\u53EF\u9760\u7684\u4EBA\u7269\u8EAB\u4EFD\u9501\u5B9A\uFF0C\u5FC5\u987B\u5148\u8865\u5145\u4EBA\u7269\u53C2\u8003\u56FE\u3002";
+  if (draft.characterMode === "strict-person" && hasCharacterReference) return "\u4F7F\u7528\u4EBA\u7269\u53C2\u8003\u56FE\u7EC4\u9501\u5B9A\u540C\u4E00\u4EBA\u7269\u7684\u8138\u578B\u3001\u4E94\u5B98\u6BD4\u4F8B\u3001\u53D1\u578B\u3001\u80A4\u8272\u548C\u6574\u4F53\u8EAB\u4EFD\uFF1B\u4EBA\u7269\u52A8\u4F5C\u53EF\u4EE5\u53D8\u5316\uFF0C\u8138\u90E8\u7ED3\u6784\u4E0D\u8981\u53D8\u5316\u3002";
+  if (draft.characterMode === "strict-person") return "\u7528\u6237\u8981\u6C42\u4EBA\u7269\u4E00\u81F4\uFF0C\u4F46\u672A\u8FDE\u63A5\u4EBA\u7269\u53C2\u8003\u56FE\uFF1B\u65E0\u6CD5\u5EFA\u7ACB\u53EF\u9760\u7684\u4EBA\u7269\u8EAB\u4EFD\u9501\u5B9A\uFF0C\u5FC5\u987B\u5148\u8865\u5145\u4EBA\u7269\u53C2\u8003\u56FE\u3002";
   return "\u5141\u8BB8\u51FA\u73B0\u4EBA\u7269\uFF0C\u4F46\u672A\u542F\u7528\u4EBA\u7269\u8EAB\u4EFD\u9501\u5B9A\uFF1B\u4E0D\u8981\u628A\u6B64\u6A21\u5F0F\u63CF\u8FF0\u4E3A\u8138\u578B\u4E00\u81F4\u4FDD\u8BC1\u3002";
 }
 function sceneDuration(totalDuration, index, count) {
@@ -560,8 +635,21 @@ function buildStoryboardFallback(draft, hasCharacterReference) {
     scenes: selectedScenes
   };
 }
-function buildStoryboardAiPrompt(draft, fallback, hasCharacterReference) {
+function referenceRoleInstruction(draft, groups) {
+  const counts = groups ? { product: groups.product.length, content: groups.content.length, person: groups.person.length, style: groups.style.length } : referenceTargets(draft);
+  const lines = [
+    "\u53C2\u8003\u56FE\u5206\u7EC4\u987A\u5E8F\uFF1A\u5546\u54C1 " + counts.product + " \u5F20\uFF1B\u5185\u5BB9\u7269 " + counts.content + " \u5F20\uFF1B\u4EBA\u7269 " + counts.person + " \u5F20\uFF1B\u98CE\u683C " + counts.style + " \u5F20\u3002",
+    "\u5546\u54C1\u53C2\u8003\u56FE\u7EC4\u53EA\u7528\u4E8E\u9501\u5B9A\u5546\u54C1\u8EAB\u4EFD\u3001\u5305\u88C5\u3001\u8F6E\u5ED3\u3001\u6BD4\u4F8B\u3001\u989C\u8272\u3001\u6750\u8D28\u3001\u914D\u4EF6\u548C\u53EF\u89C1\u6587\u5B57\u3002",
+    "\u5185\u5BB9\u7269\u53C2\u8003\u56FE\u7EC4\u53EA\u7528\u4E8E\u786E\u8BA4\u5546\u54C1\u5185\u90E8\u6216\u968F\u9644\u5185\u5BB9\u7269\u7684\u53EF\u89C1\u4E8B\u5B9E\uFF0C\u4E0D\u5F97\u628A\u5185\u5BB9\u7269\u66FF\u6362\u6210\u53E6\u4E00\u4E2A\u5546\u54C1\uFF0C\u4E0D\u5F97\u51ED\u7A7A\u8865\u5168\u672A\u5C55\u793A\u7684\u5185\u90E8\u7ED3\u6784\u3002",
+    "\u4EBA\u7269\u53C2\u8003\u56FE\u7EC4\u53EA\u7528\u4E8E\u9501\u5B9A\u540C\u4E00\u4EBA\u7269\u7684\u8138\u578B\u3001\u4E94\u5B98\u6BD4\u4F8B\u3001\u53D1\u578B\u3001\u80A4\u8272\u548C\u8EAB\u4EFD\uFF1B\u98CE\u683C\u53C2\u8003\u56FE\u7EC4\u53EA\u7528\u4E8E\u501F\u9274\u573A\u666F\u3001\u5149\u5F71\u3001\u8272\u8C03\u548C\u6784\u56FE\u6C1B\u56F4\uFF0C\u4E0D\u80FD\u6539\u53D8\u5546\u54C1\u6216\u4EBA\u7269\u8EAB\u4EFD\u3002"
+  ];
+  if (groups?.unassigned.length) lines.push("\u53E6\u6709 " + groups.unassigned.length + " \u5F20\u672A\u5206\u7EC4\u53C2\u8003\u56FE\uFF0C\u53EA\u80FD\u4F5C\u4E3A\u8865\u5145\u89C6\u89C9\u53C2\u8003\uFF0C\u4E0D\u5F97\u8986\u76D6\u5546\u54C1\u53C2\u8003\u56FE\u7EC4\u7684\u8EAB\u4EFD\u4E8B\u5B9E\u3002");
+  return lines.join(" ");
+}
+function buildStoryboardAiPrompt(draft, fallback, hasCharacterReference, groups) {
+  const roleInstruction = referenceRoleInstruction(draft, groups);
   return [
+    roleInstruction,
     `\u8BF7\u751F\u6210 ${draft.sceneCount} \u4E2A\u5546\u54C1\u5E7F\u544A\u77ED\u955C\u5934\u7684\u7ED3\u6784\u5316\u5206\u955C\u3002`,
     `\u7528\u6237\u60F3\u8981\u7684\u6548\u679C\uFF1A${draft.brief || "\u7A33\u5B9A\u5C55\u793A\u5546\u54C1\u6750\u8D28\u4E0E\u8F6E\u5ED3"}`,
     `\u5546\u54C1\u4E8B\u5B9E\uFF1A${draft.productFacts || "\u6CA1\u6709\u989D\u5916\u4E8B\u5B9E\uFF0C\u53EA\u4EE5\u5546\u54C1\u53C2\u8003\u56FE\u4E2D\u5B9E\u9645\u53EF\u89C1\u5185\u5BB9\u4E3A\u51C6"}`,
@@ -638,30 +726,28 @@ function parseStoredStoryboard(value) {
   }
 }
 function storyboardReferences(inputs, draft) {
-  const refs = [inputs[0]?.content].filter(Boolean);
-  if (draft.characterMode === "product-only") {
-    if (inputs[1]?.content) refs.push(inputs[1].content);
-  } else {
-    if (inputs[1]?.content) refs.push(inputs[1].content);
-    if (inputs[2]?.content) refs.push(inputs[2].content);
-  }
-  return refs;
+  const groups = groupInputImages(inputs, draft);
+  return [
+    ...referenceGroupEntries(groups).map(({ input }) => input.content),
+    ...groups.unassigned.map((input) => input.content)
+  ].filter(Boolean);
 }
-function buildSceneFramePrompt(scene, draft, hasCharacterReference) {
+function buildSceneFramePrompt(scene, draft, hasCharacterReference, groups) {
+  const roleInstruction = referenceRoleInstruction(draft, groups);
   return [
     "\u751F\u6210\u4E00\u5F20\u5546\u54C1\u5E7F\u544A\u5206\u955C\u9759\u5E27\uFF0C\u4E0D\u8981\u751F\u6210\u89C6\u9891\uFF0C\u4E0D\u8981\u62FC\u8D34\u591A\u4E2A\u955C\u5934\u3002",
     "\u7B2C\u4E00\u5F20\u53C2\u8003\u56FE\u662F\u5546\u54C1\u8EAB\u4EFD\u7684\u552F\u4E00\u4E8B\u5B9E\u57FA\u51C6\uFF1A\u5FC5\u987B\u4FDD\u6301\u5546\u54C1\u539F\u5305\u88C5\u3001logo\u3001\u53EF\u89C1\u6587\u5B57\u3001\u8F6E\u5ED3\u3001\u6BD4\u4F8B\u3001\u989C\u8272\u3001\u6750\u8D28\u3001\u914D\u4EF6\u548C\u5173\u952E\u7EC6\u8282\uFF0C\u4E0D\u6539\u6B3E\u3001\u4E0D\u6362\u5305\u88C5\u3001\u4E0D\u91CD\u65B0\u8BBE\u8BA1\u6B63\u9762\u7248\u5F0F\u3002",
-    draft.characterMode === "strict-person" && hasCharacterReference ? "\u7B2C\u4E8C\u5F20\u53C2\u8003\u56FE\u662F\u4EBA\u7269\u8EAB\u4EFD\u57FA\u51C6\uFF1A\u4FDD\u6301\u540C\u4E00\u4EBA\u7269\u7684\u8138\u578B\u3001\u4E94\u5B98\u6BD4\u4F8B\u3001\u53D1\u578B\u3001\u80A4\u8272\u548C\u6574\u4F53\u8EAB\u4EFD\uFF1B\u4E0D\u8981\u53D8\u8138\u3001\u6362\u4EBA\u6216\u6539\u53D8\u5934\u8EAB\u6BD4\u4F8B\u3002" : draft.characterMode === "product-only" ? "\u672C\u955C\u5934\u4E0D\u65B0\u589E\u4EBA\u7269\u3001\u624B\u6216\u4EBA\u7269\u9053\u5177\u3002" : "\u4EBA\u7269\u8EAB\u4EFD\u672A\u88AB\u4E25\u683C\u9501\u5B9A\uFF1B\u4E0D\u8981\u58F0\u79F0\u4EBA\u7269\u8138\u578B\u5DF2\u83B7\u5F97\u4FDD\u8BC1\u3002",
-    inputsRoleInstruction(draft),
+    roleInstruction,
+    draft.characterMode === "strict-person" && hasCharacterReference ? "\u4EBA\u7269\u53C2\u8003\u56FE\u7EC4\u662F\u4EBA\u7269\u8EAB\u4EFD\u57FA\u51C6\uFF1A\u4FDD\u6301\u540C\u4E00\u4EBA\u7269\u7684\u8138\u578B\u3001\u4E94\u5B98\u6BD4\u4F8B\u3001\u53D1\u578B\u3001\u80A4\u8272\u548C\u6574\u4F53\u8EAB\u4EFD\uFF1B\u4E0D\u8981\u53D8\u8138\u3001\u6362\u4EBA\u6216\u6539\u53D8\u5934\u8EAB\u6BD4\u4F8B\u3002" : draft.characterMode === "product-only" ? "\u672C\u955C\u5934\u4E0D\u65B0\u589E\u4EBA\u7269\u3001\u624B\u6216\u4EBA\u7269\u9053\u5177\u3002" : "\u4EBA\u7269\u8EAB\u4EFD\u672A\u88AB\u4E25\u683C\u9501\u5B9A\uFF1B\u4E0D\u8981\u58F0\u79F0\u4EBA\u7269\u8138\u578B\u5DF2\u83B7\u5F97\u4FDD\u8BC1\u3002",
+    inputsRoleInstruction(draft, groups),
     `\u955C\u5934\u4EFB\u52A1\uFF1A${scene.purpose}`,
     `\u5206\u955C\u9996\u5E27\u8BBE\u8BA1\uFF1A${scene.framePrompt}`,
     `\u753B\u5E45\uFF1A${draft.ratio}\u3002\u5546\u54C1\u4E3B\u4F53\u5B8C\u6574\uFF0C\u5173\u952E\u5305\u88C5\u6587\u5B57\u4E0D\u88AB\u906E\u6321\u3002\u82E5\u6709\u4EBA\u7269/\u624B\u4E0E\u5546\u54C1\u4E92\u52A8\uFF0C\u63A5\u89E6\u70B9\u6E05\u6670\u3001\u524D\u540E\u5173\u7CFB\u771F\u5B9E\uFF0C\u4E0D\u80FD\u7A7F\u6A21\u3002`,
     "\u9759\u6001\u753B\u9762\u4E0D\u8981\u5B57\u5E55\u3001\u6C34\u5370\u3001\u8D34\u7EB8\u3001\u7B2C\u4E8C\u4E2A\u5546\u54C1\u3001\u989D\u5916logo\u3001\u865A\u6784\u5305\u88C5\u80CC\u9762\u6216\u4E0D\u53EF\u89C1\u5185\u90E8\u7ED3\u6784\uFF1B\u6587\u5B57\u53EA\u4FDD\u7559\u53C2\u8003\u56FE\u4E2D\u5B9E\u9645\u53EF\u89C1\u5185\u5BB9\u3002"
   ].join("\n");
 }
-function inputsRoleInstruction(draft) {
-  if (draft.characterMode === "product-only") return "\u8FDE\u63A5\u987A\u5E8F\uFF1A\u7B2C 1 \u5F20\u662F\u5546\u54C1\u56FE\uFF1B\u7B2C 2\u30013 \u5F20\u5373\u4F7F\u5B58\u5728\u4E5F\u53EA\u53EF\u4F5C\u4E3A\u98CE\u683C\u53C2\u8003\uFF0C\u4E0D\u80FD\u6539\u53D8\u5546\u54C1\u8EAB\u4EFD\u3002";
-  return "\u8FDE\u63A5\u987A\u5E8F\uFF1A\u7B2C 1 \u5F20\u662F\u5546\u54C1\u56FE\uFF0C\u7B2C 2 \u5F20\u662F\u4EBA\u7269\u53C2\u8003\u56FE\uFF0C\u7B2C 3 \u5F20\u53EF\u9009\u4E3A\u98CE\u683C\u53C2\u8003\uFF1B\u4E0D\u5F97\u628A\u98CE\u683C\u53C2\u8003\u8BEF\u5F53\u6210\u5546\u54C1\u6216\u4EBA\u7269\u8EAB\u4EFD\u3002";
+function inputsRoleInstruction(draft, groups) {
+  return referenceRoleInstruction(draft, groups);
 }
 function buildSceneVideoPrompt(scene, draft, hasCharacterReference) {
   return [
@@ -675,13 +761,15 @@ function buildSceneVideoPrompt(scene, draft, hasCharacterReference) {
     "\u52A8\u4F5C\u5728\u524D\u534A\u6BB5\u5B8C\u6210\uFF0C\u540E\u534A\u6BB5\u7A33\u5B9A\u6536\u5C3E\uFF1B\u4E0D\u8DF3\u5207\u3001\u4E0D\u7A81\u7136\u53D8\u7126\u3001\u4E0D\u5F15\u5165\u7B2C\u4E8C\u4E2A\u52A8\u4F5C\u3002"
   ].join("\n");
 }
-function renderStoryboardMarkdown(plan, sourceLabel, hasCharacterReference) {
+function renderStoryboardMarkdown(plan, sourceLabel, hasCharacterReference, draft, groups) {
+  const roleInstruction = referenceRoleInstruction(draft, groups);
   return [
     "# Grok \u5546\u54C1\u5E7F\u544A\u811A\u672C\u4E0E\u5206\u955C",
     "",
     `- \u6807\u9898\uFF1A${plan.title}`,
     `- \u5546\u54C1\u9996\u5E27\uFF1A${sourceLabel || "\u672A\u8FDE\u63A5"}`,
-    `- \u4EBA\u7269\u53C2\u8003\uFF1A${hasCharacterReference ? "\u5DF2\u8FDE\u63A5\u7B2C\u4E8C\u5F20\u4E0A\u6E38\u4EBA\u7269\u56FE" : "\u672A\u8FDE\u63A5"}`,
+    `- \u4EBA\u7269\u53C2\u8003\uFF1A${hasCharacterReference ? "\u5DF2\u8FDE\u63A5\u4EBA\u7269\u53C2\u8003\u56FE\u7EC4" : "\u672A\u8FDE\u63A5"}`,
+    `- \u53C2\u8003\u56FE\u5206\u7EC4\uFF1A${roleInstruction}`,
     `- \u6574\u4F53\u76EE\u6807\uFF1A${plan.summary}`,
     `- \u5546\u54C1\u9501\u5B9A\uFF1A${plan.productLock}`,
     `- \u4EBA\u7269\u9501\u5B9A\uFF1A${plan.characterLock}`,
@@ -846,9 +934,10 @@ function GrokProductI2VContent({ ctx }) {
   const [busy, setBusy] = useState(null);
   const draft = readDraft(ctx);
   const inputImages = findInputImages(ctx);
-  const sourceImage = inputImages[0]?.node || null;
-  const sourceLabel = inputImages[0]?.title || "\u5546\u54C1\u9996\u5E27";
-  const hasCharacterReference = Boolean(inputImages[1]?.content);
+  const referenceGroups = groupInputImages(inputImages, draft);
+  const sourceImage = referenceGroups.product[0]?.node || null;
+  const sourceLabel = referenceGroups.product[0]?.title || "\u5546\u54C1\u9996\u5E27";
+  const hasCharacterReference = referenceGroups.person.length > 0;
   const output = metadataText(ctx.node.metadata, "content");
   const storyboardMarkdown = metadataText(ctx.node.metadata, "storyboardMarkdown");
   const positivePrompt = metadataText(ctx.node.metadata, "positivePrompt");
@@ -858,7 +947,7 @@ function GrokProductI2VContent({ ctx }) {
   const textModels = useMemo(() => ctx.ai.listModels("text"), [ctx.ai]);
   const imageModels = useMemo(() => ctx.ai.listModels("image"), [ctx.ai]);
   const videoModels = useMemo(() => ctx.ai.listModels("video"), [ctx.ai]);
-  const promptFields = /* @__PURE__ */ new Set(["brief", "productFacts", "mustKeep", "allowedChange", "forbidden", "sound", "duration", "ratio", "lockMode", "sceneCount", "characterMode", "imageModel"]);
+  const promptFields = /* @__PURE__ */ new Set(["brief", "productFacts", "mustKeep", "allowedChange", "forbidden", "sound", "duration", "ratio", "lockMode", "sceneCount", "characterMode", "imageModel", "productRefCount", "contentRefCount", "personRefCount", "styleRefCount"]);
   const setField = (key, value) => ctx.updateMetadata({ [key]: value, ...promptFields.has(key) ? { content: "", positivePrompt: "", negativePrompt: "", promptFingerprint: "", storyboardPlan: "", storyboardMarkdown: "", storyboardFingerprint: "", storyboardNotice: "" } : {} });
   const stopCanvas = (event) => event.stopPropagation();
   const fallback = () => buildPromptResult(draft, sourceLabel, Boolean(sourceImage));
@@ -900,11 +989,12 @@ function GrokProductI2VContent({ ctx }) {
       return;
     }
     if (draft.characterMode === "strict-person" && !hasCharacterReference) {
-      ctx.updateMetadata({ status: "error", errorDetails: "\u4EBA\u7269\u9501\u5B9A\u6A21\u5F0F\u9700\u8981\u7B2C\u4E8C\u5F20\u4E0A\u6E38\u56FE\u7247\u4F5C\u4E3A\u4EBA\u7269\u53C2\u8003\u56FE\u3002\u8BF7\u6309\u987A\u5E8F\u8FDE\u63A5\uFF1A\u5546\u54C1\u56FE \u2192 \u4EBA\u7269\u56FE \u2192\uFF08\u53EF\u9009\uFF09\u98CE\u683C\u56FE\u3002" });
+      ctx.updateMetadata({ status: "error", errorDetails: "\u4EBA\u7269\u9501\u5B9A\u6A21\u5F0F\u9700\u8981\u4EBA\u7269\u53C2\u8003\u56FE\u3002\u8BF7\u8BBE\u7F6E\u4EBA\u7269\u53C2\u8003\u56FE\u6570\u91CF\uFF0C\u6216\u7ED9\u4EBA\u7269\u56FE\u7247\u8282\u70B9\u6807\u9898\u52A0\u4E0A\u201C\u4EBA\u7269/\u6A21\u7279/\u4EBA\u50CF\u201D\u7B49\u5173\u952E\u8BCD\uFF1B\u8FDE\u63A5\u987A\u5E8F\u4E3A\u5546\u54C1 \u2192 \u5185\u5BB9\u7269 \u2192 \u4EBA\u7269 \u2192 \u98CE\u683C\u3002" });
       return;
     }
     const fallbackPlan = buildStoryboardFallback(draft, hasCharacterReference);
     const references = storyboardReferences(inputImages, draft);
+    const storyboardGroups = groupInputImages(inputImages, draft);
     let plan = fallbackPlan;
     let planningNotice = "";
     setBusy("storyboard");
@@ -912,7 +1002,7 @@ function GrokProductI2VContent({ ctx }) {
     try {
       if (textModels.length) {
         try {
-          const response = await ctx.ai.generateText(buildStoryboardAiPrompt(draft, fallbackPlan, hasCharacterReference), {
+          const response = await ctx.ai.generateText(buildStoryboardAiPrompt(draft, fallbackPlan, hasCharacterReference, storyboardGroups), {
             system: STORYBOARD_SYSTEM,
             model: draft.textModel || void 0
           });
@@ -926,7 +1016,7 @@ function GrokProductI2VContent({ ctx }) {
       }
       for (let index = 0; index < plan.scenes.length; index += 1) {
         const scene = plan.scenes[index];
-        const generated = await ctx.ai.generateImage(buildSceneFramePrompt(scene, draft, hasCharacterReference), {
+        const generated = await ctx.ai.generateImage(buildSceneFramePrompt(scene, draft, hasCharacterReference, storyboardGroups), {
           references,
           size: generationSize(draft.ratio),
           count: 1,
@@ -955,7 +1045,7 @@ function GrokProductI2VContent({ ctx }) {
               mimeType: imageContent.match(/^data:([^;]+);/)?.[1] || "image/png",
               generationMode: "image",
               generationType: "edit",
-              prompt: buildSceneFramePrompt(scene, draft, hasCharacterReference),
+              prompt: buildSceneFramePrompt(scene, draft, hasCharacterReference, storyboardGroups),
               storyboardOwnerId: ctx.node.id,
               storyboardSceneId: scene.id,
               storyboardSceneIndex: index,
@@ -966,7 +1056,7 @@ function GrokProductI2VContent({ ctx }) {
         ]);
         ctx.updateMetadata({ storyboardPlan: JSON.stringify(plan) });
       }
-      const markdown = renderStoryboardMarkdown(plan, sourceLabel, hasCharacterReference);
+      const markdown = renderStoryboardMarkdown(plan, sourceLabel, hasCharacterReference, draft, storyboardGroups);
       ctx.updateMetadata({
         content: markdown,
         storyboardMarkdown: markdown,
@@ -1204,15 +1294,44 @@ function GrokProductI2VContent({ ctx }) {
       /* @__PURE__ */ jsx("div", { style: { fontWeight: 700, fontSize: 14 }, children: "Grok \u5546\u54C1\u56FE\u751F\u89C6\u9891" }),
       /* @__PURE__ */ jsx("span", { style: { fontSize: 11, color: sourceImage ? "#16a34a" : "#d97706" }, children: sourceImage ? "\u9996\u5E27\u5DF2\u63A5\u5165" : "\u7B49\u5F85\u5546\u54C1\u56FE" })
     ] }),
-    inputImages.length ? /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: 5, padding: 6, borderRadius: 8, background: ctx.theme.toolbar.panel }, children: inputImages.slice(0, 3).map((input, index) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 8, alignItems: "center" }, children: [
-      /* @__PURE__ */ jsx("img", { src: input.content, alt: input.title, style: { width: 42, height: 34, borderRadius: 5, objectFit: "contain", background: "#fff" } }),
-      /* @__PURE__ */ jsxs("div", { style: { minWidth: 0, fontSize: 11, color: ctx.theme.node.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: [
-        index === 0 ? "\u5546\u54C1\u56FE" : index === 1 ? "\u4EBA\u7269\u53C2\u8003" : "\u98CE\u683C\u53C2\u8003",
-        "\uFF1A",
-        input.title
+    inputImages.length ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 5, padding: 6, borderRadius: 8, background: ctx.theme.toolbar.panel }, children: [
+      referenceGroupEntries(referenceGroups).map(({ input, role }) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 8, alignItems: "center" }, children: [
+        /* @__PURE__ */ jsx("img", { src: input.content, alt: input.title, style: { width: 42, height: 34, borderRadius: 5, objectFit: "contain", background: "#fff" } }),
+        /* @__PURE__ */ jsxs("div", { style: { minWidth: 0, fontSize: 11, color: ctx.theme.node.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: [
+          referenceRoleLabel(role),
+          "\u53C2\u8003\u56FE\uFF1A",
+          input.title
+        ] })
+      ] }, input.node.id)),
+      referenceGroups.unassigned.map((input) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 8, alignItems: "center" }, children: [
+        /* @__PURE__ */ jsx("img", { src: input.content, alt: input.title, style: { width: 42, height: 34, borderRadius: 5, objectFit: "contain", background: "#fff" } }),
+        /* @__PURE__ */ jsxs("div", { style: { minWidth: 0, fontSize: 11, color: "#d97706", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: [
+          "\u672A\u5206\u7EC4\u53C2\u8003\u56FE\uFF1A",
+          input.title
+        ] })
+      ] }, input.node.id)),
+      referenceGroups.unassigned.length ? /* @__PURE__ */ jsx("div", { style: { color: "#d97706", fontSize: 10, lineHeight: 1.35 }, children: "\u6709\u56FE\u7247\u672A\u843D\u5165\u56DB\u7EC4\uFF0C\u4ECD\u4F1A\u4F20\u7ED9\u5206\u955C\u6A21\u578B\uFF0C\u4F46\u5EFA\u8BAE\u586B\u5199\u5404\u7EC4\u6570\u91CF\u6216\u7ED9\u56FE\u7247\u8282\u70B9\u6807\u9898\u52A0\u4E0A\u89D2\u8272\u5173\u952E\u8BCD\u3002" }) : null
+    ] }) : /* @__PURE__ */ jsx("div", { style: { padding: 8, borderRadius: 8, background: "#f59e0b14", color: ctx.theme.node.muted, fontSize: 11, lineHeight: 1.45 }, children: "\u628A\u753B\u5E03\u91CC\u7684\u5546\u54C1\u56FE\u7247\u8282\u70B9\u8FDE\u63A5\u5230\u672C\u8282\u70B9\u3002\u811A\u672C\u53EF\u4EE5\u5148\u751F\u6210\uFF0C\u4F46\u751F\u6210\u5206\u955C\u56FE\u548C\u89C6\u9891\u90FD\u9700\u8981\u5546\u54C1\u56FE\u3002" }),
+    /* @__PURE__ */ jsx("div", { style: { padding: 7, borderRadius: 8, background: "#2563eb12", color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.45 }, children: "\u53C2\u8003\u56FE\u6309\u56DB\u7EC4\u8FDE\u63A5\uFF1A\u5546\u54C1 \u2192 \u5185\u5BB9\u7269 \u2192 \u4EBA\u7269 \u2192 \u98CE\u683C\uFF1B\u6BCF\u7EC4\u6700\u591A 3 \u5F20\u3002\u586B\u5199\u4E0B\u9762\u7684\u6570\u91CF\u540E\uFF0C\u672A\u6807\u6CE8\u56FE\u7247\u6309\u7EC4\u987A\u5E8F\u5F52\u7C7B\uFF1B\u56FE\u7247\u6807\u9898\u542B\u201C\u5185\u5BB9\u7269/\u4EBA\u7269/\u98CE\u683C\u201D\u7B49\u5173\u952E\u8BCD\u65F6\u4F1A\u81EA\u52A8\u8BC6\u522B\u3002\u4EBA\u7269\u548C\u98CE\u683C\u56FE\u4E0D\u80FD\u66FF\u4EE3\u5546\u54C1\u56FE\u3002" }),
+    /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }, children: [
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u5546\u54C1\u53C2\u8003\u56FE\uFF081\u20133 \u5F20\uFF09" }),
+        /* @__PURE__ */ jsx("input", { type: "number", min: 1, max: 3, step: 1, value: draft.productRefCount, onChange: (event) => setField("productRefCount", event.target.value), onMouseDown: stopCanvas, style: inputStyle })
+      ] }),
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u5185\u5BB9\u7269\u53C2\u8003\u56FE\uFF080\u20133 \u5F20\uFF09" }),
+        /* @__PURE__ */ jsx("input", { type: "number", min: 0, max: 3, step: 1, value: draft.contentRefCount, onChange: (event) => setField("contentRefCount", event.target.value), onMouseDown: stopCanvas, style: inputStyle })
+      ] }),
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u4EBA\u7269\u53C2\u8003\u56FE\uFF080\u20133 \u5F20\uFF09" }),
+        /* @__PURE__ */ jsx("input", { type: "number", min: 0, max: 3, step: 1, value: draft.personRefCount, onChange: (event) => setField("personRefCount", event.target.value), onMouseDown: stopCanvas, style: inputStyle })
+      ] }),
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u98CE\u683C\u53C2\u8003\u56FE\uFF080\u20133 \u5F20\uFF09" }),
+        /* @__PURE__ */ jsx("input", { type: "number", min: 0, max: 3, step: 1, value: draft.styleRefCount, onChange: (event) => setField("styleRefCount", event.target.value), onMouseDown: stopCanvas, style: inputStyle })
       ] })
-    ] }, input.node.id)) }) : /* @__PURE__ */ jsx("div", { style: { padding: 8, borderRadius: 8, background: "#f59e0b14", color: ctx.theme.node.muted, fontSize: 11, lineHeight: 1.45 }, children: "\u628A\u753B\u5E03\u91CC\u7684\u5546\u54C1\u56FE\u7247\u8282\u70B9\u8FDE\u63A5\u5230\u672C\u8282\u70B9\u3002\u811A\u672C\u53EF\u4EE5\u5148\u751F\u6210\uFF0C\u4F46\u751F\u6210\u5206\u955C\u56FE\u548C\u89C6\u9891\u90FD\u9700\u8981\u5546\u54C1\u56FE\u3002" }),
-    /* @__PURE__ */ jsx("div", { style: { padding: 7, borderRadius: 8, background: "#2563eb12", color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.45 }, children: "\u53C2\u8003\u56FE\u8FDE\u63A5\u987A\u5E8F\uFF1A\u7B2C 1 \u5F20\u5546\u54C1\u56FE\uFF1B\u7B2C 2 \u5F20\u4EBA\u7269\u56FE\uFF08\u8981\u9501\u8138\u578B\u65F6\u5FC5\u63A5\uFF09\uFF1B\u7B2C 3 \u5F20\u53EF\u9009\u98CE\u683C\u56FE\u3002\u4EBA\u7269\u548C\u98CE\u683C\u56FE\u4E0D\u80FD\u66FF\u4EE3\u5546\u54C1\u56FE\u3002" }),
+    ] }),
+    /* @__PURE__ */ jsx("div", { style: { color: ctx.theme.node.muted, fontSize: 10, lineHeight: 1.4 }, children: "\u672A\u4FEE\u6539\u6570\u91CF\u65F6\u517C\u5BB9\u65E7\u8282\u70B9\u987A\u5E8F\uFF1A\u5546\u54C1 \u2192\uFF08\u4E25\u683C\u4EBA\u7269\u6A21\u5F0F\u65F6\u4EBA\u7269\uFF09\u2192 \u98CE\u683C\uFF1B\u4FEE\u6539\u4EFB\u610F\u4E00\u9879\u6570\u91CF\u540E\u542F\u7528\u56DB\u7EC4\u7CBE\u786E\u5206\u914D\u3002\u6BCF\u7EC4\u6700\u591A 3 \u5F20\uFF0C\u8D85\u51FA\u7684\u56FE\u7247\u4F1A\u6807\u8BB0\u4E3A\u672A\u5206\u7EC4\u5E76\u7EE7\u7EED\u4F5C\u4E3A\u8865\u5145\u53C2\u8003\u4F20\u5165\u3002" }),
     /* @__PURE__ */ jsxs("div", { children: [
       /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u89C6\u9891\u76EE\u6807 / \u4E3B\u52A8\u4F5C" }),
       /* @__PURE__ */ jsx("textarea", { value: draft.brief, placeholder: "\u4F8B\u5982\uFF1A\u8BA9\u74F6\u8EAB\u9AD8\u5149\u4ECE\u5DE6\u5411\u53F3\u626B\u8FC7\uFF0C\u955C\u5934\u8F7B\u5FAE\u63A8\u8FD1\uFF0C\u5546\u54C1\u4FDD\u6301\u7A33\u5B9A\u3002", onChange: (event) => setField("brief", event.target.value), onMouseDown: stopCanvas, onWheel: stopCanvas, style: { ...inputStyle, minHeight: 54, resize: "vertical", lineHeight: 1.4 } })
@@ -1234,7 +1353,7 @@ function GrokProductI2VContent({ ctx }) {
         /* @__PURE__ */ jsx("label", { style: labelStyle, children: "\u4EBA\u7269\u4E00\u81F4\u6027" }),
         /* @__PURE__ */ jsxs("select", { value: draft.characterMode, onChange: (event) => setField("characterMode", event.target.value), onMouseDown: stopCanvas, style: inputStyle, children: [
           /* @__PURE__ */ jsx("option", { value: "product-only", children: "\u5546\u54C1\u5C55\u793A\uFF1A\u4E0D\u52A0\u4EBA\u7269" }),
-          /* @__PURE__ */ jsx("option", { value: "strict-person", children: "\u4EBA\u7269\u9501\u5B9A\uFF1A\u5FC5\u987B\u8FDE\u63A5\u7B2C\u4E8C\u5F20\u4EBA\u7269\u56FE" }),
+          /* @__PURE__ */ jsx("option", { value: "strict-person", children: "\u4EBA\u7269\u9501\u5B9A\uFF1A\u5FC5\u987B\u8FDE\u63A5\u4EBA\u7269\u53C2\u8003\u56FE\u7EC4" }),
           /* @__PURE__ */ jsx("option", { value: "free-person", children: "\u4EBA\u7269\u81EA\u7531\u751F\u6210\uFF1A\u4E0D\u4FDD\u8BC1\u8138\u578B" })
         ] })
       ] })
@@ -1298,7 +1417,7 @@ function GrokProductI2VContent({ ctx }) {
 var index_default = definePlugin({
   id: PLUGIN_ID,
   name: "Grok \u5546\u54C1\u56FE\u751F\u89C6\u9891",
-  version: "0.5.0",
+  version: "0.6.0",
   description: "\u628A\u5546\u54C1\u56FE\u548C\u6548\u679C\u63CF\u8FF0\u62C6\u6210\u811A\u672C\u3001\u5206\u955C\u9996\u5E27\u4E0E Grok \u9010\u955C\u5934\u56FE\u751F\u89C6\u9891\uFF0C\u5E76\u63D0\u4F9B\u5546\u54C1/\u4EBA\u7269\u4E00\u81F4\u6027\u7EA6\u675F\u4E0E\u8D28\u68C0\u6E05\u5355\u3002",
   nodes: [
     {
@@ -1326,9 +1445,12 @@ export {
   index_default as default,
   distributeSceneDurations,
   effectiveSceneCount,
+  groupInputImages,
   normalizeDuration,
+  normalizeReferenceCount,
   normalizeSceneCount,
   parseStoryboardResponse,
   promptFingerprint,
+  referenceRoleHint,
   storyboardFingerprint
 };
